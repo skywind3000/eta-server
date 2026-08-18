@@ -1,4 +1,4 @@
-# EtaServer 技术规格
+# eta-server 技术规格
 
 Eta 模板引擎 + Node.js 内置 HTTP 的 PHP 风格动态页面服务：文件路径即路由，指定一个文档根目录即可服务其下全部 .eta 脚本；另内置 CLI 渲染模式（类 `php script.php`）。单文件实现，运行时依赖仅 `eta`，以 npm 包形式发布支持 `npx` 一行启动。
 

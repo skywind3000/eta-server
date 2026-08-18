@@ -1,10 +1,10 @@
-# EtaServer
+# eta-server
 
-使用 Eta + Node.js 做一个类似 PHP 的系统。使用 EtaServer 以后，用户新建动态页面或者纯 HTTP/JSON 接口，只需要在文档根目录内新增 .eta 文件即可，不用改到服务器端任何代码。
+使用 Eta + Node.js 做一个类似 PHP 的系统。使用 eta-server 以后，用户新建动态页面或者纯 HTTP/JSON 接口，只需要在文档根目录内新增 .eta 文件即可，不用改到服务器端任何代码。
 
 ## 项目定位
 
-EtaServer 是「文件路径即路由 + PHP 超全局 bridge」的轻量动态页面服务：指定一个文档根目录，即可为根目录下所有 .eta 脚本提供页面与接口服务，新增页面 / JSON 接口只需新增文件，零服务端代码。以 npm 包形式发布，支持 `npx -y eta-server -r root -p 5000` 一行启动；同时内置 CLI 渲染模式，可像 `php script.php` 一样直接渲染单个脚本。
+eta-server 是「文件路径即路由 + PHP 超全局 bridge」的轻量动态页面服务：指定一个文档根目录，即可为根目录下所有 .eta 脚本提供页面与接口服务，新增页面 / JSON 接口只需新增文件，零服务端代码。以 npm 包形式发布，支持 `npx -y eta-server -r root -p 5000` 一行启动；同时内置 CLI 渲染模式，可像 `php script.php` 一样直接渲染单个脚本。
 
 ## 定位与安全边界
 

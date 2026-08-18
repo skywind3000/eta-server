@@ -1,5 +1,5 @@
 <%
-// index.eta - EtaServer demo home page
+// index.eta - eta-server demo home page
 // bare superglobal access thanks to useWith: _GET, _SESSION, _SERVER ...
 const name = _GET.name || 'world'
 _SESSION.count = (_SESSION.count || 0) + 1
@@ -7,11 +7,11 @@ _SESSION.count = (_SESSION.count || 0) + 1
 <html>
 <head>
   <meta charset="utf-8">
-  <title>EtaServer Demo</title>
+  <title>eta-server Demo</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <h1>EtaServer Demo</h1>
+  <h1>eta-server Demo</h1>
   <p>Hello, <b><%= name %></b>!</p>
   <p>Visits in this session: <b><%= _SESSION.count %></b>
      (signed cookie session, sliding 30 min)</p>

@@ -1,8 +1,8 @@
-# EtaServer
+# eta-server
 
 PHP 风格的 `.eta` 动态页面服务器：**文件路径即路由**，往文档根目录丢一个 `.eta` 文件就是一个页面，不用写任何服务端代码。
 
-需求见 [prd.md](prd.md)，实现细节与决策见 [spec.md](spec.md)。
+需求见 [docs/prd.md](docs/prd.md)，实现细节与决策见 [docs/spec.md](docs/spec.md)。
 
 ## 快速开始
 
@@ -29,7 +29,7 @@ _SESSION.count = (_SESSION.count || 0) + 1
 <p>第 <%= _SESSION.count %> 次访问</p>
 ```
 
-请求 `http://localhost:5000/hello.eta?name=skywind` 即得页面。`_GET` / `_POST` / `_SESSION` / `_SERVER` / `_COOKIE` / `RESP` / `require` 等 bridge 变量裸名可用（详见 prd.md Bridge API 一节）。
+请求 `http://localhost:5000/hello.eta?name=skywind` 即得页面。`_GET` / `_POST` / `_SESSION` / `_SERVER` / `_COOKIE` / `RESP` / `require` 等 bridge 变量裸名可用（详见 [docs/prd.md](docs/prd.md) Bridge API 一节）。
 
 ## 命令行渲染（CLI 模式）
 
@@ -41,7 +41,7 @@ node eta-server.js script.eta one two --x    # 额外参数经 _SERVER.argv 透�
 echo 'hi <%~ _SERVER.argv[0] %>' | node eta-server.js -   # 从 stdin 读脚本
 ```
 
-规则（对齐 PHP CLI 习惯）：脚本不限扩展名；`-` 代表 stdin；脚本名后的一切参数原样透传（`argv[0]` = 脚本自身）；include / require 以脚本所在目录为基准（stdin 时为 cwd）；渲染异常报错到 stderr、退出码 1。详见 spec.md 决策 #11。
+规则（对齐 PHP CLI 习惯）：脚本不限扩展名；`-` 代表 stdin；脚本名后的一切参数原样透传（`argv[0]` = 脚本自身）；include / require 以脚本所在目录为基准（stdin 时为 cwd）；渲染异常报错到 stderr、退出码 1。详见 [docs/spec.md](docs/spec.md) 决策 #11。
 
 ## 测试
 

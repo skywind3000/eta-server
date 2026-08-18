@@ -8,8 +8,8 @@
   },
   "files": [
     "eta-server.js",
-    "prd.md",
-    "spec.md"
+    "docs/prd.md",
+    "docs/spec.md"
   ],
   "scripts": {
     "start": "node eta-server.js -r demo",
@@ -24,6 +24,15 @@
     "file-routing"
   ],
   "license": "MIT",
+  "author": "skywind3000",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skywind3000/eta-server.git"
+  },
+  "homepage": "https://github.com/skywind3000/eta-server",
+  "bugs": {
+    "url": "https://github.com/skywind3000/eta-server/issues"
+  },
   "engines": {
     "node": ">=22.18"
   },

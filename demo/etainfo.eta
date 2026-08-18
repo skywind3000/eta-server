@@ -1,9 +1,9 @@
 <%
 //
-// etainfo() - 类似 phpinfo() 的 EtaServer 信息页
+// etainfo() - 类似 phpinfo() 的 eta-server 信息页
 //
 // 版本号经 require('../package.json') 读取（require 锚定本模板目录，
-// 向上一级即 EtaServer 包根；require 整个 eta-server.js 也不会启动
+// 向上一级即 eta-server 包根；require 整个 eta-server.js 也不会启动
 // 服务器，因为 require.main !== module）。
 //
 const os = require('node:os')
@@ -94,13 +94,13 @@ a {color:#666699;}
 </head>
 <body>
 <div class="banner">
-<h1>etainfo() <span>- EtaServer <%= etaServerVersion %></span></h1>
+<h1>etainfo() <span>- eta-server <%= etaServerVersion %></span></h1>
 </div>
 <div class="wrap">
 
 <h2>System</h2>
 <table>
-<tr><td class="e">EtaServer Version</td><td class="v"><%= etaServerVersion %></td></tr>
+<tr><td class="e">eta-server Version</td><td class="v"><%= etaServerVersion %></td></tr>
 <tr><td class="e">Node.js Version</td><td class="v"><%= process.version %></td></tr>
 <tr><td class="e">Node.js Executable</td><td class="v"><%= process.execPath %></td></tr>
 <tr><td class="e">Platform</td><td class="v"><%= os.platform() %> <%= os.release() %></td></tr>
@@ -173,7 +173,7 @@ a {color:#666699;}
 </table>
 
 <p class="foot">
-etainfo() - generated at <%= nowStr %> by EtaServer <%= etaServerVersion %>
+etainfo() - generated at <%= nowStr %> by eta-server <%= etaServerVersion %>
 (Eta <%= etaVersion %> / Node.js <%= process.version %>)
 </p>
 

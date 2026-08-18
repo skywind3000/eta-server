@@ -103,7 +103,7 @@ function errorPage (code, title, detail) {
   body += 'pre{background:#f5f5f5;padding:1em;overflow:auto}</style></head>'
   body += '<body><h1>' + code + ' ' + escapeHtml(title) + '</h1>'
   if (detail) body += '<pre>' + escapeHtml(detail) + '</pre>'
-  body += '<hr><p>EtaServer ' + VERSION + '</p></body></html>\n'
+  body += '<hr><p>eta-server ' + VERSION + '</p></body></html>\n'
   return body
 }
 
@@ -843,7 +843,7 @@ function startServer (rootDir, port, host) {
 }
 
 function printBanner (root, port, host) {
-  console.log('EtaServer ' + VERSION + ' (PHP-style .eta server)')
+  console.log('eta-server ' + VERSION + ' (PHP-style .eta server)')
   console.log('  root : ' + root)
   console.log('  url  : http://' + (host === '0.0.0.0' ? '127.0.0.1' : host) +
     ':' + port + '/')
