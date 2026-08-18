@@ -7,7 +7,7 @@
  * Requires Node 18+ (global fetch).
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/02/16 20:30:00
+ * Last Modified: 2026/08/19 00:00:00
  *
  * ===================================================================== */
 'use strict'
@@ -18,7 +18,8 @@ const os = require('node:os')
 const path = require('node:path')
 const assert = require('node:assert')
 
-const PORT = 5177
+// overridable so parallel CI jobs don't collide on the fixed default
+const PORT = Number(process.env.ETA_TEST_PORT) || 5177
 const BASE = 'http://127.0.0.1:' + PORT
 const ROOT = path.join(__dirname, '..', 'demo')
 const SERVER = path.join(__dirname, '..', 'eta-server.js')
@@ -155,6 +156,50 @@ async function main () {
       await res.text()
     })
 
+    await check('legal "..b" filenames are not mistaken for escapes',
+      async () => {
+        // path.relative(root, root/'..b.eta') = '..b.eta': a '..'
+        // prefix check would 404 this legal name (fail-closed but
+        // broken); the first-segment check must serve it
+        writeDemo('..b.eta', 'DOUBLE-DOT-NAME')
+        const res = await fetch(BASE + '/..b.eta')
+        assert.strictEqual(res.status, 200)
+        assert.ok((await res.text()).indexOf('DOUBLE-DOT-NAME') >= 0)
+      })
+
+    await check('server source 404 incl. case variants (root=package dir)',
+      async () => {
+        const pkgRoot = path.join(__dirname, '..')
+        const port2 = PORT + 1
+        const BASE2 = 'http://127.0.0.1:' + port2
+        const child2 = spawn(process.execPath,
+          [SERVER, '-r', pkgRoot, '-p', String(port2)],
+          { stdio: ['ignore', 'pipe', 'pipe'] })
+        try {
+          for (let i = 0; i < 50; i++) {
+            try {
+              const r = await fetch(BASE2 + '/package.json')
+              await r.text()
+              break
+            } catch (e) {
+              await new Promise(r => setTimeout(r, 200))
+            }
+          }
+          for (const name of ['/eta-server.js', '/ETA-SERVER.js',
+            '/Eta-Server.JS']) {
+            const res = await fetch(BASE2 + name)
+            await res.text()
+            assert.strictEqual(res.status, 404, name)
+          }
+          // root itself is functional: only the self file is blocked
+          const ok = await fetch(BASE2 + '/package.json')
+          assert.strictEqual(ok.status, 200)
+          await ok.text()
+        } finally {
+          child2.kill()
+        }
+      })
+
     await check('PATH_INFO tail is passed to script', async () => {
       const res = await fetch(BASE + '/hello.eta/linwei/42')
       assert.strictEqual(res.status, 200)
@@ -234,6 +279,22 @@ async function main () {
       const body = await res.text()
       assert.ok(body.indexOf('require() demo') >= 0)
       assert.ok(body.indexOf('SCRIPT_DIRNAME') >= 0)
+    })
+
+    await check('require()d local files hot-reload on edit', async () => {
+      // Node's module cache is shared across createRequire instances;
+      // the mtime-based invalidation must make library edits visible
+      // without a server restart
+      const lib = writeDemo('_t_hotlib.js', 'module.exports = "v1"\n')
+      writeDemo('_t_hot.eta', '<%~ require("./_t_hotlib.js") %>')
+      const r1 = await fetch(BASE + '/_t_hot.eta')
+      assert.strictEqual(await r1.text(), 'v1')
+      fs.writeFileSync(lib, 'module.exports = "v2"\n')
+      // guarantee a strictly newer mtime regardless of fs granularity
+      const t = new Date(Date.now() + 1000)
+      fs.utimesSync(lib, t, t)
+      const r2 = await fetch(BASE + '/_t_hot.eta')
+      assert.strictEqual(await r2.text(), 'v2')
     })
 
     await check('TypeScript library loads via require(.ts)', async () => {
@@ -424,6 +485,36 @@ async function main () {
       assert.strictEqual(sess.length, 1)
       assert.ok(sess[0].indexOf('evil') < 0)
     })
+
+    await check('setcookie with non-numeric maxage omits Max-Age',
+      async () => {
+        writeDemo('_t_maxage.eta',
+          '<% RESP.setcookie("c", "v", {maxage: "abc"}) %>ok')
+        const res = await fetch(BASE + '/_t_maxage.eta')
+        assert.strictEqual(res.status, 200)
+        await res.text()
+        const all = res.headers.getSetCookie
+          ? res.headers.getSetCookie() : []
+        const mine = all.filter((c) => c.startsWith('c='))
+        assert.strictEqual(mine.length, 1)
+        assert.ok(mine[0].indexOf('Max-Age') < 0, 'no Max-Age=NaN')
+      })
+
+    await check('hop-by-hop headers from templates are dropped',
+      async () => {
+        writeDemo('_t_hop.eta',
+          '<% RESP.header("Transfer-Encoding", "chunked") %>' +
+          '<% RESP.header("Connection", "close") %>' +
+          '<% RESP.header("X-Ok", "1") %>ok')
+        const res = await fetch(BASE + '/_t_hop.eta')
+        assert.strictEqual(res.status, 200)
+        await res.text()
+        assert.strictEqual(res.headers.get('transfer-encoding'), null)
+        // Node itself may emit its own Connection: keep-alive; the
+        // point is the template's 'close' must not pass through
+        assert.notStrictEqual(res.headers.get('connection'), 'close')
+        assert.strictEqual(res.headers.get('x-ok'), '1')
+      })
 
     // ==================== RESP small parity items ====================
 

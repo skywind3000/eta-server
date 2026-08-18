@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/18 00:00:00
+ * Last Modified: 2026/08/19 00:00:00
  *
  * ===================================================================== */
 'use strict'
@@ -26,7 +26,7 @@ const os = require('node:os')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.1.0'
+const VERSION = '0.1.2'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -34,6 +34,26 @@ const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
 // cookie is silently dropped by browsers anyway; fail loudly instead
 const SESSION_COOKIE_LIMIT = 4096
 const SELF_PATH = path.resolve(__filename)
+// realpath of our own file: realpath also expands 8.3 short names
+// (ETASE~1.JS), so comparing resolved paths covers them. Note Windows
+// realpathSync does NOT normalize case, hence isSelfPath() below
+// compares case-insensitively on win32
+const SELF_PATH_REAL = (() => {
+  try { return fs.realpathSync(SELF_PATH) } catch (e) { return SELF_PATH }
+})()
+
+// self-protection predicate: case-insensitive on win32, where the
+// file system happily opens 'ETA-SERVER.js' for 'eta-server.js' and
+// a raw string comparison would miss the variant entirely
+function isSelfPath (p) {
+  if (p === SELF_PATH || p === SELF_PATH_REAL) return true
+  if (process.platform === 'win32') {
+    const lp = String(p).toLowerCase()
+    return lp === SELF_PATH.toLowerCase() ||
+      lp === SELF_PATH_REAL.toLowerCase()
+  }
+  return false
+}
 
 // extension whitelist for static files (fail-closed outside this table)
 const STATIC_TYPES = {
@@ -80,6 +100,16 @@ const STATIC_TYPES = {
 
 const HTML_SPECIAL = {
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+}
+
+// RFC 7230 hop-by-hop semantics are owned by the framework: a template
+// setting these would clash with the buffered-body Content-Length model
+// (e.g. CL + TE double headers, a request-smuggling surface), so they
+// are dropped with a stderr warning at response assembly time
+const HOP_BY_HOP_HEADERS = {
+  'connection': 1, 'keep-alive': 1, 'proxy-authenticate': 1,
+  'proxy-authorization': 1, 'te': 1, 'trailer': 1,
+  'transfer-encoding': 1, 'upgrade': 1,
 }
 
 /* ---------------------------------------------------------------------
@@ -281,11 +311,15 @@ function win32BadSegment (name) {
   return DEVICE_NAME.test(name)
 }
 
-// containment check: p equals root or lives strictly inside it
+// containment check: p equals root or lives strictly inside it.
+// The first-segment test (rather than a '..' prefix test) keeps legal
+// names like '..b' servable: path.relative reports '..b.eta' for them,
+// which a startsWith('..') check would mistake for an escape
 function containsPath (root, p) {
   if (p === root) return true
   const rel = path.relative(root, p)
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
+  if (rel === '' || path.isAbsolute(rel)) return false
+  return rel.split(path.sep)[0] !== '..'
 }
 
 // realpath containment: resolve symlinks / junctions, reject anything
@@ -335,7 +369,12 @@ function makeResp () {
       }
       opts = opts || {}
       let s = encodeURIComponent(name) + '=' + encodeURIComponent(String(value))
-      if (opts.maxage != null) s += '; Max-Age=' + Math.floor(Number(opts.maxage))
+      if (opts.maxage != null) {
+        // non-numeric maxage ('abc' -> NaN) is ignored rather than
+        // shipped as 'Max-Age=NaN'
+        const ma = Math.floor(Number(opts.maxage))
+        if (Number.isFinite(ma)) s += '; Max-Age=' + ma
+      }
       if (opts.expires) {
         const exp = opts.expires.toUTCString
           ? opts.expires.toUTCString() : String(opts.expires)
@@ -369,12 +408,55 @@ function makeResp () {
 }
 
 /* ---------------------------------------------------------------------
+ * hot reload for require()'d local files
+ * ------------------------------------------------------------------- */
+
+// Node's module cache is process-wide: every createRequire instance
+// shares it, so libraries loaded by a template would survive edits
+// until a restart — defeating the "edits take effect immediately"
+// promise for the recommended thin-template + .ts-library split.
+// Track the mtime seen at load time for files under the document root
+// and drop the cache entry when the file on disk becomes newer.
+// node_modules and out-of-root files stay cached (reloading framework
+// dependencies mid-flight is unsafe). Invalidation is shallow: only
+// the entry itself is dropped — cached parents keep their old
+// references (see known limitations).
+const hotMtimes = new Map()
+
+function makeDevRequire (rootReal, scriptAbs) {
+  const base = createRequire(scriptAbs)
+  const devRequire = function (spec) {
+    let resolved = null
+    try { resolved = base.resolve(String(spec)) } catch (e) { /* below */ }
+    if (resolved && containsPath(rootReal, resolved)) {
+      let mtimeMs = -1
+      try { mtimeMs = fs.statSync(resolved).mtimeMs } catch (e) { /* -1 */ }
+      if (mtimeMs >= 0) {
+        const seen = hotMtimes.get(resolved)
+        if (seen !== undefined && mtimeMs > seen) {
+          delete require.cache[resolved]
+        }
+        hotMtimes.set(resolved, mtimeMs)
+      }
+    }
+    return base(spec)
+  }
+  devRequire.resolve = base.resolve
+  devRequire.cache = require.cache
+  return devRequire
+}
+
+/* ---------------------------------------------------------------------
  * template rendering pipeline
  * ------------------------------------------------------------------- */
 
-function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx) {
+function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx,
+  reqStart) {
   const headers = req.headers
-  const now = Date.now()
+  // request-start instant captured at dispatcher entry (PHP semantics:
+  // REQUEST_TIME marks the arrival of the request, not the moment the
+  // body upload finished)
+  const now = reqStart || Date.now()
   const env = {
     REQUEST_METHOD: req.method,
     QUERY_STRING: parsed.queryString,
@@ -401,7 +483,8 @@ function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx) {
   return env
 }
 
-async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName, pathInfo) {
+async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
+  pathInfo, reqStart) {
   let bodyBuf = Buffer.alloc(0)
   try {
     bodyBuf = await readBody(req)
@@ -441,14 +524,15 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName, pat
     _GET: query,
     _POST: post,
     _REQUEST: Object.assign(Object.create(null), query, post),
-    _SERVER: buildServerEnv(req, parsed, scriptAbs, scriptName, pathInfo, ctx),
+    _SERVER: buildServerEnv(req, parsed, scriptAbs, scriptName, pathInfo,
+      ctx, reqStart),
     _COOKIE: cookies,
     _SESSION: session,
     _BODY: bodyBuf,
     _JSON: jsonVal,
     RESP: resp,
     escape: escapeHtml,
-    require: createRequire(scriptAbs),
+    require: makeDevRequire(ctx.rootReal, scriptAbs),
   }
 
   let html = ''
@@ -475,8 +559,15 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName, pat
   const setCookies = []
   for (const pair of resp.headers) {
     const name = pair[0]
-    if (name.toLowerCase() === 'set-cookie') {
+    const lname = name.toLowerCase()
+    if (lname === 'set-cookie') {
       setCookies.push(pair[1])
+      continue
+    }
+    if (HOP_BY_HOP_HEADERS[lname]) {
+      // hop-by-hop headers are framework-owned (see HOP_BY_HOP_HEADERS)
+      console.error('eta-server: warning: RESP.header("' + name + '") is ' +
+        'a hop-by-hop header and is ignored')
       continue
     }
     headers[name] = pair[1]
@@ -543,6 +634,9 @@ function sendStatic (req, res, abs, type) {
  * ------------------------------------------------------------------- */
 
 async function handleRequest (req, res, ctx) {
+  // PHP semantics: REQUEST_TIME marks request arrival, captured before
+  // the body upload (which can take a while for big POSTs)
+  const reqStart = Date.now()
   // ---- slash merging: //a///b -> 308 /a/b (checked on the raw URL
   // first, because new URL() would treat a leading '//' as
   // protocol-relative and misparse the host part) ----
@@ -598,7 +692,11 @@ async function handleRequest (req, res, ctx) {
   if (!containsPath(root, target)) {
     return sendError(res, 404, 'Not Found')
   }
-  if (target === SELF_PATH) {
+  // ---- self-protection, fast path: exact / case-variant / 8.3 match
+  // against the server's own file. Checked again after realpath
+  // resolution below (symlinked / junctioned routes to the same real
+  // file are covered there) ----
+  if (isSelfPath(target)) {
     return sendError(res, 404, 'Not Found')
   }
 
@@ -630,11 +728,14 @@ async function handleRequest (req, res, ctx) {
       return sendError(res, 404, 'Not Found')
     }
     // realpath containment: a symlink / junction inside root pointing
-    // outside must not be rendered
-    if (!realInside(ctx.rootReal, scriptAbs)) {
+    // outside must not be rendered; a route whose real location is the
+    // server's own file is 404 too
+    const realScript = realInside(ctx.rootReal, scriptAbs)
+    if (!realScript || isSelfPath(realScript)) {
       return sendError(res, 404, 'Not Found')
     }
-    return renderTemplate(req, res, ctx, parsed, scriptAbs, scriptRel, pathInfo)
+    return renderTemplate(req, res, ctx, parsed, scriptAbs, scriptRel,
+      pathInfo, reqStart)
   }
 
   // ---- directory branch: 301 slash, then index fallbacks ----
@@ -645,9 +746,11 @@ async function handleRequest (req, res, ctx) {
     return sendError(res, 404, 'Not Found')
   }
   // realpath containment applies to both directories and static files:
-  // a symlink / junction escaping the root is a plain 404
+  // a symlink / junction escaping the root is a plain 404 — as is any
+  // route whose real location resolves to the server's own file
+  // (case-insensitive on win32, 8.3 short names expanded by realpath)
   const real = realInside(ctx.rootReal, target)
-  if (!real) {
+  if (!real || isSelfPath(real)) {
     return sendError(res, 404, 'Not Found')
   }
   if (stat.isDirectory()) {
@@ -667,7 +770,8 @@ async function handleRequest (req, res, ctx) {
           return sendError(res, 404, 'Not Found')
         }
         const name = pathname + 'index.eta'
-        return renderTemplate(req, res, ctx, parsed, idxEta, name, '')
+        return renderTemplate(req, res, ctx, parsed, idxEta, name, '',
+          reqStart)
       }
     } catch (e) { /* no index.eta */ }
     for (const name of ['index.html', 'index.htm']) {
@@ -918,12 +1022,26 @@ if (require.main === module) {
       process.exit(1)
     })
   } else {
+    // crash guards: a bug in a template's detached async callback
+    // (setTimeout, an orphan .then chain) must not kill the whole dev
+    // server — log and keep serving (single-process equivalent of
+    // PHP-FPM's per-request worker isolation)
+    process.on('uncaughtException', (err) => {
+      console.error('eta-server: uncaught exception (server kept alive):')
+      console.error((err && err.stack) ? err.stack : String(err))
+    })
+    process.on('unhandledRejection', (reason) => {
+      console.error('eta-server: unhandled rejection (server kept alive):')
+      console.error((reason && reason.stack) ? reason.stack : String(reason))
+    })
     startServer(opts.root, opts.port, opts.host).then((server) => {
       printBanner(path.resolve(opts.root), opts.port, opts.host)
-      process.on('SIGINT', () => {
+      const shutdown = () => {
         server.close(() => process.exit(0))
         setTimeout(() => process.exit(0), 1000).unref()
-      })
+      }
+      process.on('SIGINT', shutdown)
+      process.on('SIGTERM', shutdown)
     }).catch((err) => {
       console.error('eta-server: ' + err.message)
       process.exit(1)

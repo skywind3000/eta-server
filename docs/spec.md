@@ -58,7 +58,8 @@ require: createRequire(scriptAbs)
 - bare specifiers walk up the directory tree searching `node_modules`;
 - consistent with Node's native behavior for "a .js file in the same directory";
 - ESM static `import` syntax is unavailable (non-module scope); when needed, use the dynamic `await import()` form;
-- **Templates can require `.ts` files**: Node 22.18+ built-in type stripping (no dependencies at all), hence "thin JS template shell + logic pushed down into .ts library files" is the recommended split; limitation: erasable syntax only (enum / namespace / parameter properties throw). The template code blocks themselves do not go through type stripping (they take the `new Function` compilation path), so `<% %>` blocks remain JS-only; `engines.node >= 22.18` exists precisely for this feature.
+- **Templates can require `.ts` files**: Node 22.18+ built-in type stripping (no dependencies at all), hence "thin JS template shell + logic pushed down into .ts library files" is the recommended split; limitation: erasable syntax only (enum / namespace / parameter properties throw). The template code blocks themselves do not go through type stripping (they take the `new Function` compilation path), so `<% %>` blocks remain JS-only; `engines.node >= 22.18` exists precisely for this feature;
+- **hot reload for require()'d local files** (decision #15): `createRequire` instances share Node's process-wide module cache, so without intervention a library edit would need a server restart — defeating decision #1's "edits take effect immediately" for the recommended thin-template + .ts split. Files under the document root are tracked by mtime and their cache entry is dropped when the file becomes newer; `node_modules` and out-of-root files stay cached; invalidation is shallow (see known limitations).
 
 ### Decision #4: `<%= %>` escapes by default (Eta native autoEscape)
 
@@ -73,7 +74,7 @@ The signed-cookie scheme is fully self-implemented; no express-session:
 - signature comparison via `timingSafeEqual`, length mismatches rejected up front;
 - sliding 30-minute timeout (`SESSION_TTL`); whenever the session is non-empty, each response re-signs and refreshes;
 - empty session but the request carries the cookie → `Max-Age=0` clears it;
-- key derivation: `SHA256('eta-server|hostname|username|homedir|all non-zero MACs sorted and comma-joined|realpath(root)')`; nothing on disk, stable on the same machine, differs across machines, and **differs across roots on the same machine** (decision #13). The MAC mix uses **all** NICs rather than the first one: enumeration order is not guaranteed stable across reboots and may pick a virtual adapter; taking only the first would silently invalidate all sessions whenever NIC order changes (review fix); `os.userInfo()` / `networkInterfaces()` are both wrapped in try fallbacks;
+- key derivation: `SHA256('eta-server|hostname|username|homedir|all non-zero MACs sorted and comma-joined|realpath(root)')`; nothing on disk, stable on the same machine, differs across machines, and **differs across roots on the same machine** (decision #13). The MAC mix uses **all** NICs rather than the first one: enumeration order is not guaranteed stable across reboots and may pick a virtual adapter; taking only the first would silently invalidate all sessions whenever NIC order changes (review fix); `os.userInfo()` / `networkInterfaces()` are both wrapped in try fallbacks. **Strength boundary**: every seed item is enumerable by any local user of the same machine, so "tamper-proof" holds against the client side only, not against other local users (see known limitations);
 - cookie attributes fixed at `Path=/; HttpOnly; SameSite=Lax`, no Max-Age (browser-session cookie).
 
 ### Decision #6: output model — respond only after rendering returns
@@ -92,7 +93,7 @@ Eta rendering is a pure function (returns a complete string), so there is inhere
 - PATH_INFO: `lower.indexOf('.eta/')` splits script from suffix (first hit wins); the suffix is passed via `_SERVER.PATH_INFO`;
 - directories: missing trailing slash gets a 301 (`Location` preserves the query string), then `index.eta` (through the template pipeline) / `index.html` / `index.htm` in order;
 - static whitelist in `STATIC_TYPES` (38 kinds: web / text / data / images / fonts / audio-video / wasm / archives; `.js`/`.mjs` are `text/javascript`); outside the whitelist is 404; existing but verb not GET/HEAD → 405 + `Allow: GET, HEAD` (whitelist takes precedence; 404 never leaks existence via 405);
-- the server's own file (`SELF_PATH`) is 404 on hit, preventing source disclosure when the docroot happens to be the package directory.
+- the server's own file (`SELF_PATH`) is 404 on hit, preventing source disclosure when the docroot happens to be the package directory. Matched via `isSelfPath()` against `realpathSync(SELF_PATH)` — covering 8.3 short names — and **case-insensitively on win32**, where the case-insensitive file system would otherwise open `ETA-SERVER.js` for a raw string comparison miss (decision #15). Checked at three points: dispatcher fast path, template-branch realpath result, and static/directory-branch realpath result.
 
 ### Decision #8: zero-dependency principle
 
@@ -151,6 +152,21 @@ An external review empirically found and fixed three classes of issues:
 
 A batch of small fixes landed together: `RESP.status()` stores the raw value without coercing (the old `Number(code) || 200` silently mapped `status('abc')`/`status(0)` to 200), validation moved earlier to right after rendering ends (invalid codes no longer waste a session re-sign); port argument validation tightened to integers in 1–65535 (previously `Number()` plus an emptiness check let floats/negatives/out-of-range through); the `error` listener in `startServer` is removed after listen succeeds (avoiding a later server-level error rejecting an already-settled Promise).
 
+### Decision #15: second review fix batch (SELF_PATH case bypass, require hot-reload, and four more)
+
+A second external review found six issues (three empirically reproduced); all fixed:
+
+- **SELF_PATH self-protection bypassed by case variants (win32, security)**: the old check was a raw string comparison `target === SELF_PATH`; on the case-insensitive Windows file system a request for `/ETA-SERVER.js` skipped it while `stat`/`realpath` succeeded as usual — with the package directory as docroot the server's own source was downloadable (empirically: HTTP 200, full file). Fix: `isSelfPath()` compares against `realpathSync(SELF_PATH)` (8.3 short names expand through realpath) and **case-insensitively on win32** (measured: Windows `realpathSync` does not normalize case, so a realpath-only comparison is insufficient). Checked at three points: dispatcher fast path, template-branch realpath result, static/directory-branch realpath result;
+- **require module cache broke the hot-reload promise (decision #1)**: `createRequire` instances share Node's process-wide module cache (empirically: two instances `require('eta')` return the same object), so edits to `require('./lib.ts')` needed a restart — exactly the code recommended by decision #9's split did not enjoy the flagship hot-reload feature. Fix: `makeDevRequire()` tracks mtimes for files under the docroot and drops the cache entry when the file becomes newer; `node_modules` and out-of-root files stay cached (reloading framework dependencies mid-flight is unsafe); invalidation is shallow (see known limitations);
+- **`containsPath` false-positive on `..`-prefixed legal names**: `startsWith('..')` misread `path.relative`'s `'..b.eta'` result as an escape, permanently 404-ing legal `..b` files (fail-closed direction, no escape risk — but a functional bug). Fixed to a first-segment comparison (`rel.split(path.sep)[0] !== '..'`); real escapes still rejected (regression-tested);
+- **hop-by-hop header injection**: `RESP.header()` accepted any name, so a template could set `Transfer-Encoding` next to the framework's `Content-Length` — the RFC 7230-forbidden CL+TE double header (request-smuggling surface). Response assembly now drops the eight hop-by-hop names (connection / keep-alive / proxy-authenticate / proxy-authorization / te / trailer / transfer-encoding / upgrade) with a stderr warning; `Content-Length` stays unconditionally framework-owned;
+- **`Max-Age=NaN`**: `setcookie({maxage:'abc'})` wrote `Max-Age=NaN` into the cookie; non-finite maxage is now ignored;
+- **`REQUEST_TIME` semantics**: previously sampled after the body read (a large POST shifted it far from the true request start, diverging from PHP). Now captured at dispatcher entry and threaded layer by layer into `buildServerEnv`;
+- **crash guards + graceful shutdown (robustness)**: HTTP startup mode registers `uncaughtException` / `unhandledRejection` handlers (log and keep serving — a template's detached async bug no longer kills the whole dev server; the single-process approximation of PHP-FPM per-request isolation); `SIGTERM` shares `SIGINT`'s graceful shutdown handler (containers / CI / pm2);
+- **test infrastructure**: the test port is overridable via `ETA_TEST_PORT` (parallel CI); new assertions cover all of the above (see Tests).
+
+Four design-level findings from the same review are documented as known limitations rather than fixed: session key strength, concurrent session lost updates, synchronous FS on the hot path, no Range/ETag static serving (see below).
+
 ## Bridge API list
 
 | Name | Type | Description |
@@ -161,9 +177,9 @@ A batch of small fixes landed together: `RESP.status()` stores the raw value wit
 | `_SESSION` | object | signed-cookie session (decision #5); whole cookie over 4KB → 500 (decision #13) |
 | `_BODY` | Buffer | raw request body (counterpart of `php://input`) |
 | `_JSON` | object/null | auto-parsed when Content-Type contains the `json` substring (covers `application/json`, `application/*+json`, `text/json`); parse failure / non-json → null |
-| `RESP` | object | `status/header/redirect/setcookie/json/writeraw/escape` (status stores raw value, validated after rendering: not an integer in 100–999 → 500, decision #14; setcookie colliding with the session name → dropped, decision #13) |
+| `RESP` | object | `status/header/redirect/setcookie/json/writeraw/escape` (status stores raw value, validated after rendering: not an integer in 100–999 → 500, decision #14; setcookie colliding with the session name → dropped, decision #13; hop-by-hop header names dropped with a warning, decision #15) |
 | `escape(v)` | function | HTML escape (`& < > " '`), returns a string; `RESP.escape` is the same function |
-| `require(spec)` | function | Node require anchored at the template directory (decision #3) |
+| `require(spec)` | function | Node require anchored at the template directory (decision #3); local files under the docroot hot-invalidate on mtime change (decision #15) |
 
 `_SERVER` keys: `REQUEST_METHOD`, `QUERY_STRING` (raw request-line slice, encoded original text), `REQUEST_URI` (req.url original), `SCRIPT_NAME`, `PATH_INFO`, `SCRIPT_FILENAME`, `SCRIPT_DIRNAME`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME`, `SERVER_PORT`, `REQUEST_SCHEME` (always `http`), `SERVER_PROTOCOL` (`HTTP/` + req.httpVersion), `REQUEST_TIME` / `REQUEST_TIME_FLOAT` (request start instant, set in both HTTP and CLI modes), plus `HTTP_*` request headers (uppercased, `-`→`_`).
 
@@ -173,22 +189,22 @@ Unified `errorPage(code, title, detail)`: monospace font + `<pre>` with escaped 
 
 ## Tests
 
-- `tests/test_server.js`: spawns a child process running the server (port 5177), fetch-based assertions for HTTP mode;
+- `tests/test_server.js`: spawns a child process running the server (port 5177, overridable via `ETA_TEST_PORT` for parallel CI), fetch-based assertions for HTTP mode;
 - `tests/test_cli.js`: spawnSync assertions for CLI render mode (decision #11): file rendering byte-exact, argv passthrough (argv[0]=script itself, args after the script that look like `-H` pass through verbatim), degraded `_SERVER` key set and empty bridge, no extension enforcement (.txt renders too), missing file / render exception exit 1 with clean stdout, include base = script directory, require anchored at the script directory, writeraw / json short-circuit, RESP response-control no-ops, BOM tolerated, trailing newline preserved, options before the script name accepted; stdin (`-`) rendering, three-key degradation (SCRIPT_NAME/FILENAME='-', SCRIPT_DIRNAME=cwd), argv[0]='-', include/require base = cwd, exceptions exit 1, BOM tolerated.
 
-HTTP mode has 41 assertions:
+HTTP mode has 46 assertions:
 
 - rendering: index.eta, `/` fallback, query params;
 - directories: 301 trailing slash, index.html fallback, **escaping index candidates 404 one by one (fail-closed even with a legitimate index.html beside)**;
 - static: Content-Type, 405, outside-whitelist 404, extended type matrix (csv/md/js/webm asserted per type, `.js` = text/javascript);
-- security: 404, `../` traversal 404, **realpath escape (junction/symlink out of root → 404, both template and static paths)**, in-container symlinks served normally, DOS device names, NTFS ADS, trailing-dot platform divergence, duplicate-slash 308 (bare `//` and `%2f`-encoded, both paths);
+- security: 404, `../` traversal 404, **realpath escape (junction/symlink out of root → 404, both template and static paths)**, in-container symlinks served normally, DOS device names, NTFS ADS, trailing-dot platform divergence, duplicate-slash 308 (bare `//` and `%2f`-encoded, both paths), **legal `..b` filenames served (first-segment containment, decision #15)**, **server source 404 including case variants (a second instance with docroot = package directory, decision #15)**;
 - PATH_INFO suffix (`<%~ %>` raw-outputs a JSON array);
 - API: GET echo, form POST, JSON body, **+json Content-Type feeding `_JSON`**, **over-64MB body empirically receives 413 on the client side**;
 - bridge: **HTTP `_SERVER` includes SERVER_PROTOCOL / REQUEST_TIME(_FLOAT)**, **prototype keys (`__proto__`/`constructor`/`hasOwnProperty`) are just ordinary data keys**;
 - **concurrency: 8×4MB POSTs overlapping a window of 40 tagged GETs, per-request assertion that `_GET` never mixes up (decision #14, discriminating against the old `ctx.parsed` implementation, empirically reproduced and re-verified)**;
-- session: three-level chained cookie counting 1→2→3, tampered signature rejected (count resets to 1), **over 4KB → 500, deriveSecret root-mixing unit assertion, setcookie same-name exclusivity (not sent + exactly one framework entry)**;
-- RESP: **status(9999) / status(0) / status('abc') → 500, RESP.escape equivalent to escape()**;
-- require: demo page rendering;
+- session: three-level chained cookie counting 1→2→3, tampered signature rejected (count resets to 1), **over 4KB → 500, deriveSecret root-mixing unit assertion, setcookie same-name exclusivity (not sent + exactly one framework entry)**, **non-numeric maxage omits Max-Age (no `Max-Age=NaN`, decision #15)**;
+- RESP: **status(9999) / status(0) / status('abc') → 500, RESP.escape equivalent to escape()**, **hop-by-hop headers dropped with a warning (Transfer-Encoding / Connection filtered, ordinary headers pass, decision #15)**;
+- require: demo page rendering, **required local files hot-reload on edit (mtime-driven cache invalidation, v1→v2 without restart, decision #15)**;
 - 500: broken.eta (calls an undefined function).
 
 How to run: `npm test` (the tests themselves need Node 18+ for global fetch; `engines.node >= 22.18` is required by the in-template `require(.ts)` type-stripping feature — npm only warns on engines in pure test scenarios, doesn't block; test_server.js and test_cli.js run in sequence).
@@ -211,7 +227,13 @@ The server is single-process single-threaded (Node's default model), but async I
 - `_GET` / `_POST` / `_REQUEST` are plain objects; same-name parameters overwrite earlier values (no `getlist`-style multi-value access API);
 - template include resolves relative to `views` (document root in HTTP mode, script directory / cwd in CLI mode), not the template's own directory;
 - CLI mode has no PHP exit() flush-then-exit semantics (Eta's pure-function rendering has no mid-flush path, decision #11);
-- `RESP.write()` is a placeholder that throws explicitly (prompts you to use template text output); don't use it per PHP `echo` habits.
+- `RESP.write()` is a placeholder that throws explicitly (prompts you to use template text output); don't use it per PHP `echo` habits;
+- **the session signing key is not a secret**: every `deriveSecret` seed (hostname / username / home / all NIC MACs / root realpath) is enumerable by any local user of the same machine (`ipconfig /all` etc.), so "tamper-proof" holds against the client side only — another local user on a shared host can forge session cookies wholesale, and the key never rotates; acceptable for the trusted-environment positioning; a random secret persisted outside the root (with fingerprint fallback) is the phase-two upgrade;
+- **concurrent session writes are last-write-wins**: the stateless cookie session carries no lock — two overlapping requests that read-modify-write the same session lose the earlier write (PHP's file sessions hold a lock until `session_write_close`; this design has no equivalent). Avoid concurrent writers to one session;
+- **the hot path is synchronous FS** (`stat`/`realpath`/`readFileSync` per request): negligible with a warm local cache, but network drives / real-time antivirus / very large templates serialize all concurrent requests (decision #14 fixed request-state pollution; this throughput ceiling remains);
+- **static serving has no Range / ETag / Last-Modified**: `<video>` seeking is unavailable (full 200 only) and browsers re-download fully every time (no 304), despite audio/video types being whitelisted;
+- **require hot-invalidation is shallow** (decision #15): only the mtime-changed entry itself is dropped; cached parent modules keep stale references (A requires B, B edits → A's cached copy still holds old B until A itself changes or the server restarts);
+- **crash guards keep serving, not exiting**: `uncaughtException` / `unhandledRejection` only log (decision #15); if process state is ever corrupted, restart manually with Ctrl+C.
 
 ## Publishing
 

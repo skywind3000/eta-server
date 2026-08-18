@@ -1,0 +1,30 @@
+<%
+// _REQUEST merges GET + POST params (POST wins on conflict)
+const filter = (_REQUEST.role || 'all').toLowerCase()
+const users = [
+  { name: 'alice', role: 'admin' },
+  { name: 'bob',   role: 'user'  },
+  { name: 'carol', role: 'user'  },
+]
+%><!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Users</title></head>
+<body>
+<h1>User directory</h1>
+<p>Filter: <b><%= filter %></b></p>
+<ul>
+<% for (const u of users) { %>
+<%   if (filter === 'all' || u.role === filter) { %>
+  <li><b><%= u.name %></b> — <%= u.role -%></li>
+<%   } %>
+<% } %>
+</ul>
+<%
+// top-level await works inside code blocks
+const resp = await fetch('https://api.github.com/zen',
+  { signal: AbortSignal.timeout(5000) })
+const zen = resp.ok ? await resp.text() : '(fetch failed)'
+%>
+<footer>Server wisdom: <%= zen %></footer>
+</body>
+</html>
