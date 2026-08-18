@@ -1,22 +1,24 @@
 <%
-// fetchdemo.eta - 在模板里请求其他 URL（顶层 await + 内置 fetch）
+// fetchdemo.eta - requesting other URLs from a template (top-level await + built-in fetch)
 //
-// renderAsync 把模板编译为 async function 体，代码块内可顶层 await；
-// 等待网络期间事件循环照常服务其它请求，不会阻塞单线程。
+// renderAsync compiles the template into an async function body, so code blocks
+// can use top-level await; while waiting on the network the event loop keeps
+// serving other requests, the single thread never blocks.
 //
-// 本例演示两种用法：
-//   1. 自请求：fetch 本服务的 hello.eta（不依赖外网，随时可跑）
-//   2. 外部 URL：把 url 换成 'https://api.github.com/users/nodejs/repos'
-//      之类即可，写法完全相同
+// This example shows two usages:
+//   1. self request: fetch this server's own hello.eta (no external network needed)
+//   2. external URL: just swap url for something like
+//      'https://api.github.com/users/nodejs/repos', the code is identical
 //
-// （注意：注释里勿书写标签字面量，解析器是纯文本扫描会误判）
+// (note: never write literal tag syntax inside comments - the parser is a
+// plain-text scanner and would mis-parse them)
 const url = 'http://' + _SERVER.SERVER_NAME + ':' + _SERVER.SERVER_PORT +
   '/hello.eta/from-fetchdemo'
 let text = null
 let error = null
 try {
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 8000)   // 8 秒超时保护
+  const timer = setTimeout(() => ctrl.abort(), 8000)   // 8 second timeout guard
   const resp = await fetch(url, { signal: ctrl.signal })
   clearTimeout(timer)
   if (!resp.ok) throw new Error('HTTP ' + resp.status)
@@ -32,7 +34,7 @@ try {
   <% if (error) { %>
     <p style="color:#a00">fetch failed: <%= error %></p>
   <% } else { %>
-    <p>下面是 await fetch 拿到的 hello.eta 响应原文：</p>
+    <p>Below is the raw hello.eta response obtained via await fetch:</p>
     <pre><%= text %></pre>
   <% } %>
   <p><a href="index.eta">back home</a></p>

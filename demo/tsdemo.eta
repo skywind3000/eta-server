@@ -1,5 +1,5 @@
 <%
-// tsdemo.eta - 模板保持薄壳，业务逻辑放 .ts 库文件
+// tsdemo.eta - keep templates thin, put business logic in .ts library files
 const { formatUser, sum } = require('./tslib.ts')
 const users = [
   { name: 'alice', age: 30 },
@@ -10,8 +10,9 @@ const users = [
 <head><meta charset="utf-8"><title>TypeScript demo</title></head>
 <body>
   <h1>TypeScript in eta-server</h1>
-  <p>模板里只能写 JS，但逻辑库可以是 .ts ——
-     本页即 <code>require('./tslib.ts')</code> 而来，零编译步骤。</p>
+  <p>Template code blocks are JS-only, but logic libraries can be .ts —
+     this page comes straight from <code>require('./tslib.ts')</code>,
+     zero build step.</p>
   <ul>
   <% for (const u of users) { %>
     <li><%= formatUser(u) %></li>

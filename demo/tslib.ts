@@ -1,8 +1,9 @@
-// tslib.ts - TypeScript 业务库示例
+// tslib.ts - TypeScript business library example
 //
-// 由 Node 22.18+ 内置类型剥离支持，模板里直接 require('./tslib.ts')，
-// 无需 tsc / ts-node / tsx。注意仅支持可擦除语法：类型注解、interface、
-// type、泛型可用；enum、namespace、参数属性不可用。
+// Supported by Node 22.18+ built-in type stripping: templates can just
+// require('./tslib.ts'), no tsc / ts-node / tsx needed. Note that only
+// erasable syntax is supported: type annotations, interface, type and
+// generics work; enum, namespace and parameter properties do not.
 
 export interface User {
   name: string
