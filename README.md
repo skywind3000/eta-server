@@ -45,6 +45,45 @@ _SESSION.count = (_SESSION.count || 0) + 1
 
 Request `http://localhost:5000/hello.eta?name=skywind` and you get the page. That's the whole workflow: new page = new file.
 
+### A more complete example
+
+Code blocks and HTML freely interleave — open a block with `<%`, drop into markup, reopen it to close the loop, exactly the PHP rhythm:
+
+```html
+<%
+// _REQUEST merges GET + POST params (POST wins on conflict)
+const filter = (_REQUEST.role || 'all').toLowerCase()
+const users = [
+  { name: 'alice', role: 'admin' },
+  { name: 'bob',   role: 'user'  },
+  { name: 'carol', role: 'user'  },
+]
+%><!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Users</title></head>
+<body>
+<h1>User directory</h1>
+<p>Filter: <b><%= filter %></b></p>
+<ul>
+<% for (const u of users) { %>
+<%   if (filter === 'all' || u.role === filter) { %>
+  <li><b><%= u.name %></b> — <%= u.role %></li>
+<%   } %>
+<% } %>
+</ul>
+<%
+// top-level await works inside code blocks
+const resp = await fetch('https://api.github.com/zen',
+  { signal: AbortSignal.timeout(5000) })
+const zen = resp.ok ? await resp.text() : '(fetch failed)'
+%>
+<footer>Server wisdom: <%= zen %></footer>
+</body>
+</html>
+```
+
+Request `http://localhost:5000/users.eta?role=user` and only the `user` entries render. Note the `<% %>` blocks inside the loop: one opens the `for`, markup follows, then another block supplies the closing `}` — control flow and HTML weave together line by line. Since rendering preserves source layout (`autoTrim: false`), the blank lines left by code blocks are expected; if that bothers you, put the whole loop on fewer lines or post-process the output.
+
 ### Template syntax
 
 | Syntax | Meaning |
