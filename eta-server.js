@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/19 00:00:00
+ * Last Modified: 2026/08/20 00:00:00
  *
  * ===================================================================== */
 'use strict'
@@ -26,7 +26,7 @@ const os = require('node:os')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.1.2'
+const VERSION = '0.1.3'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -442,6 +442,7 @@ function makeDevRequire (rootReal, scriptAbs) {
     return base(spec)
   }
   devRequire.resolve = base.resolve
+  devRequire.resolve.paths = base.resolve.paths
   devRequire.cache = require.cache
   return devRequire
 }
@@ -765,8 +766,11 @@ async function handleRequest (req, res, ctx) {
       if (fs.statSync(idxEta).isFile()) {
         // index candidates get their own containment check: the
         // directory passed, but an index symlink inside it may still
-        // point outside the root
-        if (!realInside(ctx.rootReal, idxEta)) {
+        // point outside the root — or at the server's own file (a
+        // target inside the root escapes the containment check, so
+        // isSelfPath is the only guard here)
+        const realIdx = realInside(ctx.rootReal, idxEta)
+        if (!realIdx || isSelfPath(realIdx)) {
           return sendError(res, 404, 'Not Found')
         }
         const name = pathname + 'index.eta'
@@ -778,10 +782,18 @@ async function handleRequest (req, res, ctx) {
       const f = path.join(real, name)
       try {
         if (fs.statSync(f).isFile()) {
-          if (!realInside(ctx.rootReal, f)) {
+          const realF = realInside(ctx.rootReal, f)
+          if (!realF || isSelfPath(realF)) {
             return sendError(res, 404, 'Not Found')
           }
-          return sendStatic(req, res, f, STATIC_TYPES[path.extname(f)])
+          // Content-Type judged by the realpath extension (decision
+          // #12), not the symlink's own name; outside the whitelist
+          // stays fail-closed 404 (no fallback to the next candidate)
+          const type = STATIC_TYPES[path.extname(realF).toLowerCase()]
+          if (!type) {
+            return sendError(res, 404, 'Not Found')
+          }
+          return sendStatic(req, res, realF, type)
         }
       } catch (e) { /* keep looking */ }
     }

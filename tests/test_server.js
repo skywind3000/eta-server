@@ -195,6 +195,27 @@ async function main () {
           const ok = await fetch(BASE2 + '/package.json')
           assert.strictEqual(ok.status, 200)
           await ok.text()
+          // fourth self-protection point: an index candidate inside
+          // the root symlinking to the self file — the containment
+          // check cannot catch it (target is inside the root), only
+          // isSelfPath can; both index.eta and index.html branches
+          const idxDir = path.join(pkgRoot, '_t_selfidx')
+          fs.mkdirSync(idxDir)
+          try {
+            fs.symlinkSync(path.join(pkgRoot, 'eta-server.js'),
+              path.join(idxDir, 'index.html'))
+            const r1 = await fetch(BASE2 + '/_t_selfidx/')
+            await r1.text()
+            assert.strictEqual(r1.status, 404, 'index.html -> self symlink')
+            fs.rmSync(path.join(idxDir, 'index.html'))
+            fs.symlinkSync(path.join(pkgRoot, 'eta-server.js'),
+              path.join(idxDir, 'index.eta'))
+            const r2 = await fetch(BASE2 + '/_t_selfidx/')
+            await r2.text()
+            assert.strictEqual(r2.status, 404, 'index.eta -> self symlink')
+          } finally {
+            fs.rmSync(idxDir, { recursive: true, force: true })
+          }
         } finally {
           child2.kill()
         }
