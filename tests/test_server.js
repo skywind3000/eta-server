@@ -747,6 +747,31 @@ async function main () {
       assert.ok(body3.indexOf('invalid status') >= 0)
     })
 
+    await check('invalid header names/values fail at render time',
+      async () => {
+        // used to throw at res.writeHead() instead: an opaque 500 and
+        // a mismatched status line ('HTTP/1.1 500 OK'); now the four
+        // reachable channels fail during rendering with a coherent 500
+        writeDemo('t_badhdr.eta',
+          '<% if (_GET.k === "name") RESP.header("X Y", "v") %>' +
+          '<% if (_GET.k === "value") RESP.header("X-Y", "a\\nb: c") %>' +
+          '<% if (_GET.k === "cookie") RESP.setcookie("c", "v", ' +
+          '{ domain: "a\\nb.com" }) %>' +
+          '<% if (_GET.k === "redir") RESP.redirect("/a\\nb: c") %>ok')
+        for (const k of ['name', 'value', 'cookie', 'redir']) {
+          const res = await fetch(BASE + '/t_badhdr.eta?k=' + k)
+          assert.strictEqual(res.status, 500, k)
+          // the status line must agree with the code (no '500 OK')
+          assert.strictEqual(res.statusText, 'Internal Server Error', k)
+          const body = await res.text()
+          assert.ok(body.indexOf('Internal Server Error') >= 0, k)
+        }
+        // the happy path is unaffected
+        const ok = await fetch(BASE + '/t_badhdr.eta')
+        assert.strictEqual(ok.status, 200)
+        assert.strictEqual(await ok.text(), 'ok')
+      })
+
     await check('prototype-named query keys stay plain data', async () => {
       const res = await fetch(BASE +
         '/api.eta?__proto__=pwned&constructor=c&hasOwnProperty=h')
@@ -796,6 +821,8 @@ async function main () {
       writeDemo('.404.eta',
         '<% if (_GET.bad) RESP.status("abc") %>' +
         '<% if (_GET.big) _SESSION.blob = "x".repeat(5000) %>' +
+        '<% if (_GET.hdr) RESP.header("X Y", "v") %>' +
+        '<% if (_GET.val) RESP.header("X-Y", "a\\nb: c") %>' +
         'CUSTOM-404:<%~ _SERVER.REQUEST_URI %>' +
         ':qs=<%~ typeof _SERVER.QUERY_STRING %>')
       const res = await fetch(BASE + '/definitely-missing')
@@ -818,6 +845,13 @@ async function main () {
       const rg = await fetch(BASE + '/definitely-missing?big=1')
       assert.strictEqual(rg.status, 404)
       assert.ok((await rg.text()).indexOf('CUSTOM-404') < 0)
+      // ...and invalid response headers (validated at RESP.header()
+      // record time, decision #19)
+      for (const q of ['hdr=1', 'val=1']) {
+        const rh = await fetch(BASE + '/definitely-missing?' + q)
+        assert.strictEqual(rh.status, 404, q)
+        assert.ok((await rh.text()).indexOf('CUSTOM-404') < 0, q)
+      }
       // rejected paths keep the same status (fail-closed)
       const r2 = await fetch(BASE + '/tests/../eta-server.js')
       assert.strictEqual(r2.status, 404)

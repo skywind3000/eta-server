@@ -218,6 +218,16 @@ The review also re-verified every v0.3.0 fix empirically (duplicate CL/CT gone, 
 
 **Post-release amendment (fifth review, v0.3.2)**: the "broken fallback degrades to the built-in page — never to a non-404" promise had two more holes after rendering — an invalid `RESP.status()` (status validation) and an oversized session (>4KB cookie limit) both returned 500 from a `.404.eta` page (empirically reproduced). Both `sendError(500)` sites now honor `plain404OnError`: log one stderr line and emit the built-in 404, same as the render-exception path. Cosmetic consistency fix alongside: the `.well-known` exemption now folds case like the `node_modules` match next to it (direction stays fail-closed — ACME only uses lowercase).
 
+### Decision #19: sixth review — header validation moved to record time
+
+The fifth-review audit of "what else can escape `plain404OnError`" found a third hole in the same family, this one in `res.writeHead()` itself, affecting normal pages too: illegal header names / values were only validated by Node at the final `res.writeHead(resp.code, headers)` — a line with no try/catch — so the exception escaped to the dispatcher catch-all. Two consequences (both empirically reproduced): `.404.eta` pages returned 500 (the "never to a non-404" promise broken again), and — since `writeHead` assigns `statusCode` / `statusMessage` BEFORE validating headers — the first attempt's reason phrase survived into the retry, emitting `HTTP/1.1 500 OK` / `500 Found` / `500 Not Found` status lines (wrong error type + counter-intuitive status line; NOT a security issue — Node's `validateHeaderValue` rejects newline values outright, so no CRLF injection; the reachable channels were four: `RESP.header` name, `RESP.header` value, `RESP.setcookie` option strings inside the assembled Set-Cookie, `RESP.redirect` URL inside Location).
+
+Fix (following the review's suggestion): validation moved to record time using Node's own public validators (zero dependencies):
+
+- `RESP.header()` calls `http.validateHeaderName()` + `http.validateHeaderValue()` immediately; `RESP.redirect()` routes its Location through `resp.header()`; `RESP.setcookie()` validates the fully assembled Set-Cookie string through `validateHeaderValue`. Invalid input now throws during rendering and lands in the render-exception branch: normal pages get a 500 whose stack points at the offending template line (better to debug than the old opaque 500), and `.404.eta` pages degrade cleanly to the built-in 404 via `plain404OnError` — all three holes sealed at once;
+- belt-and-suspenders: the final `writeHead` / `end` pair in both the bodyless and normal paths is wrapped in try/catch — any header that still fails validation degrades through the same rules (fallback → 404 + stderr, normal → 500), and `res.statusMessage` is reset before the retry so a mismatched status line can never be emitted;
+- regression tests: four channels on a normal page assert 500 + `Internal Server Error` reason phrase + error page body (plus the untouched happy path), and the `.404.eta` fixture gained two header-breaking conditions asserting the degraded 404.
+
 ## Bridge API list
 
 | Name | Type | Description |
@@ -228,7 +238,7 @@ The review also re-verified every v0.3.0 fix empirically (duplicate CL/CT gone, 
 | `_SESSION` | object | signed-cookie session (decision #5); whole cookie over 4KB → 500 (decision #13); wholesale reassignment (`_SESSION = {}` / `null`) clears the session, read back after rendering (decision #17) |
 | `_BODY` | Buffer | raw request body (counterpart of `php://input`) |
 | `_JSON` | object/null | auto-parsed when Content-Type contains the `json` substring (covers `application/json`, `application/*+json`, `text/json`); parse failure / non-json → null |
-| `RESP` | object | `status/header/redirect/setcookie/json/writeraw/escape` (status stores raw value, validated after rendering: not an integer in 200–999 → 500 — the 1xx class is rejected too, decisions #14/#18; setcookie colliding with the session name → dropped, decision #13; hop-by-hop header names dropped with a warning, decision #15; header names normalized case-insensitively — Content-Length dropped with a warning, list-based names accumulate, others last-write-wins, decision #17) |
+| `RESP` | object | `status/header/redirect/setcookie/json/writeraw/escape` (status stores raw value, validated after rendering: not an integer in 200–999 → 500 — the 1xx class is rejected too, decisions #14/#18; setcookie colliding with the session name → dropped, decision #13; hop-by-hop header names dropped with a warning, decision #15; header names normalized case-insensitively — Content-Length dropped with a warning, list-based names accumulate, others last-write-wins, decision #17; header names/values validated at record time with Node's rules — invalid input is a render-time error, never a late writeHead failure, decision #19) |
 | `escape(v)` | function | HTML escape (`& < > " '`), returns a string; `RESP.escape` is the same function |
 | `require(spec)` | function | Node require anchored at the template directory (decision #3); local files under the docroot hot-invalidate on mtime change (decision #15) |
 
@@ -243,7 +253,7 @@ Unified `errorPage(code, title, detail)`: monospace font + `<pre>` with escaped 
 - `tests/test_server.js`: spawns a child process running the server (port 5177, overridable via `ETA_TEST_PORT` for parallel CI), fetch-based assertions for HTTP mode;
 - `tests/test_cli.js`: spawnSync assertions for CLI render mode (decision #11): file rendering byte-exact, argv passthrough (argv[0]=script itself, args after the script that look like `-H` pass through verbatim), degraded `_SERVER` key set and empty bridge, no extension enforcement (.txt renders too), missing file / render exception exit 1 with clean stdout, include base = script directory, require anchored at the script directory, writeraw / json short-circuit, RESP response-control no-ops, BOM tolerated, trailing newline preserved, options before the script name accepted; stdin (`-`) rendering, three-key degradation (SCRIPT_NAME/FILENAME='-', SCRIPT_DIRNAME=cwd), argv[0]='-', include/require base = cwd, exceptions exit 1, BOM tolerated.
 
-HTTP mode has 60 checks (symlink-dependent probes self-SKIP on systems without file-symlink privilege — win32 needs elevation / developer mode; junction-based probes stay unconditional):
+HTTP mode has 61 checks (symlink-dependent probes self-SKIP on systems without file-symlink privilege — win32 needs elevation / developer mode; junction-based probes stay unconditional):
 
 - rendering: index.eta, `/` fallback, query params;
 - directories: 301 trailing slash, index.html fallback, **escaping index candidates 404 one by one (fail-closed even with a legitimate index.html beside)**, **directories named `*.eta` fall back to normal serving (decision #17)**;
@@ -257,8 +267,9 @@ HTTP mode has 60 checks (symlink-dependent probes self-SKIP on systems without f
 - RESP: status(9999) / status(0) / status('abc') → 500, **status(100) → 500 (1xx class rejected, decision #18)**, RESP.escape equivalent to escape(), hop-by-hop headers dropped with a warning (decision #15), **header names normalized case-insensitively — lowercase Content-Type overrides the default, template Content-Length dropped, same-name different-case overwrites instead of duplicating (decision #17)**, **list-based Link headers keep every value (decision #17)**, **204 strips body / Content-Length / Content-Type (decision #17)**;
 - require: demo page rendering, **required local files hot-reload on edit (mtime-driven cache invalidation, v1→v2 without restart, decision #15)**;
 - 500: broken.eta (calls an undefined function);
-- **`.404.eta` fallback renders custom 404 pages (rejected paths keep the status; early-404 branches expose `QUERY_STRING` to it; the fallback file itself stays unroutable, decisions #17/#18)**;
+- **`.404.eta` fallback renders custom 404 pages (rejected paths keep the status; early-404 branches expose `QUERY_STRING` to it; post-render failures — invalid status, oversized session, invalid headers — all degrade to the built-in 404, decisions #17/#18/#19; the fallback file itself stays unroutable)**;
 - **static fd lifecycle: an aborted download still releases the fd (decision #18)**;
+- **invalid header names/values fail at record time: four channels (header name / value / setcookie / redirect) give a coherent 500 with the right reason phrase — no more "HTTP/1.1 500 OK" (decision #19)**;
 - **access log (decision #16/#17): CLF line for rendered pages on stderr, `--access-log <file>` appends to a file and stays out of stderr, `--quiet` produces no access lines at all, destination is per server instance (two in-process servers keep separate logs)**.
 
 How to run: `npm test` (the tests themselves need Node 18+ for global fetch; `engines.node >= 22.18` is required by the in-template `require(.ts)` type-stripping feature — npm only warns on engines in pure test scenarios, doesn't block; test_server.js and test_cli.js run in sequence).

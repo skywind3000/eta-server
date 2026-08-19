@@ -26,7 +26,7 @@ const os = require('node:os')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.3.2'
+const VERSION = '0.3.3'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -517,7 +517,20 @@ function makeResp (defaultStatus) {
     binary: null,                // writeraw buffer, null until touched
     text: null,                  // RESP.json() body, null until set
     header: function (name, value) {
-      resp.headers.push([String(name), String(value)])
+      const n = String(name)
+      const v = String(value)
+      // validated NOW, not at res.writeHead(): thrown here it surfaces
+      // as a render-time error (normal pages get a 500 whose stack
+      // points at the offending template line; a .404.eta page
+      // degrades cleanly to 404 via plain404OnError). Escaping all
+      // the way to writeHead produced an opaque 500 — worse, the
+      // failed writeHead's statusMessage survived into the retry
+      // ("HTTP/1.1 500 OK") — and broke the fallback "never to a
+      // non-404" promise (sixth review). Node's own validators,
+      // zero dependencies
+      http.validateHeaderName(n)
+      http.validateHeaderValue(n, v)
+      resp.headers.push([n, v])
     },
     status: function (code) {
       // stored raw: validated at assembly time (non 100-999 integer
@@ -527,7 +540,10 @@ function makeResp (defaultStatus) {
     },
     redirect: function (url, code) {
       resp.code = code || 302
-      resp.headers.push(['Location', String(url)])
+      // through resp.header() so the Location value gets the same
+      // render-time validation (a newline in the URL used to throw
+      // at writeHead instead)
+      resp.header('Location', url)
     },
     setcookie: function (name, value, opts) {
       // session cookie name monopoly: a script
@@ -556,6 +572,10 @@ function makeResp (defaultStatus) {
       s += '; SameSite=' + (opts.samesite || 'Lax')
       if (opts.httponly !== false) s += '; HttpOnly'
       if (opts.secure) s += '; Secure'
+      // domain / path / expires come straight from template opts, so
+      // validate the assembled line through the same channel as
+      // RESP.header() (sixth review)
+      http.validateHeaderValue('Set-Cookie', s)
       resp.headers.push(['Set-Cookie', s])
     },
     json: function (data) {
@@ -836,8 +856,30 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   }
   if (setCookies.length > 0) headers['Set-Cookie'] = setCookies
 
+  // ---- last-resort response guard: RESP.header / setcookie / redirect
+  // all validate at record time, so nothing invalid should reach
+  // writeHead; should it ever happen anyway, keep it out of the
+  // dispatcher catch-all. res.statusMessage must be cleared first: a
+  // failed writeHead leaves its reason phrase behind, and the retry
+  // would emit "HTTP/1.1 500 OK" (sixth review) ----
+  const writeFailed = (err) => {
+    res.statusMessage = undefined
+    if (opts.plain404OnError) {
+      console.error('eta-server: fallback response assembly failed (' +
+        ((err && err.message) || err) +
+        '), degrading to the built-in 404')
+      return sendError(res, 404, 'Not Found')
+    }
+    return sendError(res, 500, 'Internal Server Error',
+      String((err && err.stack) || err))
+  }
+
   if (noBody) {
-    res.writeHead(resp.code, headers)
+    try {
+      res.writeHead(resp.code, headers)
+    } catch (err) {
+      return writeFailed(err)
+    }
     res.end()
     return
   }
@@ -856,7 +898,11 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
 
   const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
   headers['Content-Length'] = buf.length
-  res.writeHead(resp.code, headers)
+  try {
+    res.writeHead(resp.code, headers)
+  } catch (err) {
+    return writeFailed(err)
+  }
   res.end(req.method === 'HEAD' ? undefined : buf)
 }
 
