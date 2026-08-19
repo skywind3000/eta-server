@@ -26,7 +26,7 @@ const os = require('node:os')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.3.0'
+const VERSION = '0.3.1'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -54,8 +54,9 @@ function isSelfPath (p) {
     lp === SELF_PATH_REAL.toLowerCase()
 }
 
-// extension whitelist for static files (fail-closed outside this table)
-const STATIC_TYPES = {
+// extension whitelist for static files (fail-closed outside this table);
+// null-prototype dict (decision #14 parity)
+const STATIC_TYPES = Object.assign(Object.create(null), {
   '.html': 'text/html; charset=utf-8',
   '.htm': 'text/html; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
@@ -95,7 +96,7 @@ const STATIC_TYPES = {
   '.gz': 'application/gzip',
   '.tgz': 'application/gzip',
   '.xz': 'application/x-xz',
-}
+})
 
 const HTML_SPECIAL = {
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -104,19 +105,22 @@ const HTML_SPECIAL = {
 // RFC 7230 hop-by-hop semantics are owned by the framework: a template
 // setting these would clash with the buffered-body Content-Length model
 // (e.g. CL + TE double headers, a request-smuggling surface), so they
-// are dropped with a stderr warning at response assembly time
-const HOP_BY_HOP_HEADERS = {
+// are dropped with a stderr warning at response assembly time;
+// null-prototype dict, otherwise RESP.header('constructor', ...) would
+// hit the inherited Object.prototype member (decision #14 parity)
+const HOP_BY_HOP_HEADERS = Object.assign(Object.create(null), {
   'connection': 1, 'keep-alive': 1, 'proxy-authenticate': 1,
   'proxy-authorization': 1, 'te': 1, 'trailer': 1,
   'transfer-encoding': 1, 'upgrade': 1,
-}
+})
 
 // list-based response headers that legitimately carry multiple
 // values: repeated RESP.header() calls accumulate (emitted joined by
-// ', ' per RFC 9110 list syntax) instead of the usual last-write-wins
-const MULTI_VALUE_HEADERS = {
+// ', ' per RFC 9110 list syntax) instead of the usual last-write-wins;
+// null-prototype dict (decision #14 parity)
+const MULTI_VALUE_HEADERS = Object.assign(Object.create(null), {
   'link': 1, 'www-authenticate': 1, 'proxy-authenticate': 1,
-}
+})
 
 /* ---------------------------------------------------------------------
  * utilities
@@ -453,18 +457,31 @@ function realInside (rootReal, abs) {
   return containsPath(rootReal, real) ? real : null
 }
 
-// hidden-path convention (decision #17): segments starting with '_' or
-// '.', plus node_modules directories, are never served — not as
-// templates, not as static files, not as directory indexes, fail-closed
-// 404 indistinguishable from "does not exist". Decision #9's
-// thin-template architecture pushes logic into library files under the
-// docroot; those (and config files) belong behind such names, mirroring
-// PHP ecosystems where .php sources / .htaccess / underscore includes
-// are never emitted raw. The _404.eta fallback page is private by the
-// same rule.
+// hidden-path convention (decision #17, re-chosen in #18): segments
+// starting with '.' plus node_modules directories (matched case-
+// insensitively — win32 / APFS open 'NODE_MODULES' as 'node_modules',
+// and realpathSync normalizes case on neither) are never served: not
+// as templates, not as static files, not as directory indexes,
+// fail-closed 404. '.well-known' is exempt (RFC 8615: ACME challenges,
+// apple-app-site-association). Underscore prefixes are deliberately
+// PUBLIC: mainstream build tools emit them (_next/, _astro/, _nuxt/,
+// _app/, _static/) and "drop a static export into the docroot" is the
+// most common usage — the original underscore rule silently 404'd
+// every asset there. Server-side files belong behind dot names instead
+// (.config.json, .lib/util.ts — .ts is outside the static whitelist
+// anyway). Every block logs one stderr line (decision #18), so a
+// mysterious 404 is diagnosable at a glance. The .404.eta fallback
+// page is unroutable by the same dot rule.
 function isPrivateSegment (seg) {
-  return seg === 'node_modules' || seg.charAt(0) === '_' ||
-    seg.charAt(0) === '.'
+  if (seg === '.well-known') return false
+  return seg.toLowerCase() === 'node_modules' || seg.charAt(0) === '.'
+}
+
+// one stderr line per hidden-path 404: turns "why does this 404?"
+// from archaeology into a glance (decision #18)
+function logBlocked (req) {
+  console.error('eta-server: blocked by hidden-path convention: ' +
+    req.method + ' ' + req.url)
 }
 
 // URL level: pathname always starts with '/', the empty first segment
@@ -703,7 +720,10 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     html = await ctx.eta.renderStringAsync(src, data)
   } catch (err) {
     if (opts.plain404OnError) {
-      // fallback pages must never turn a 404 into anything else
+      // fallback pages must never turn a 404 into anything else —
+      // but do not swallow the template bug silently (decision #18)
+      console.error('eta-server: fallback page crashed, degrading to ' +
+        'the built-in 404: ' + ((err && err.stack) ? err.stack : err))
       return sendError(res, 404, 'Not Found')
     }
     const detail = (err && err.stack) ? err.stack : String(err)
@@ -712,8 +732,11 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
 
   // ---- status validation: checked
   // right after rendering, before session re-signing, so an invalid
-  // code wastes neither the session update nor the response ----
-  if (!Number.isInteger(resp.code) || resp.code < 100 || resp.code > 999) {
+  // code wastes neither the session update nor the response. The 1xx
+  // class is rejected too (decision #18): a buffered-body model has
+  // no meaningful interim response, and Node used to emit a fake
+  // Content-Length on a body it then dropped ----
+  if (!Number.isInteger(resp.code) || resp.code < 200 || resp.code > 999) {
     return sendError(res, 500, 'Internal Server Error',
       'invalid status code: ' + resp.code)
   }
@@ -861,6 +884,12 @@ function sendStatic (req, res, abs, type) {
   stream.on('error', () => {
     try { res.destroy() } catch (e) { /* ignore */ }
   })
+  // client aborts (page reload, cancelled media loads) destroy res,
+  // but pipe() only UNPIPES the source — without this the stream never
+  // ends and autoClose never fires, leaking the fd (decision #18)
+  res.on('close', () => {
+    try { stream.destroy() } catch (e) { /* ignore */ }
+  })
   stream.pipe(res)
 }
 
@@ -878,14 +907,15 @@ function fallbackParsed (req) {
   return p
 }
 
-// 404 with an optional custom error page (decision #17): when the
-// document root contains a '_404.eta' script it is rendered with a
-// default status of 404 (the script may override via RESP.status()).
-// The underscore convention keeps the file itself unroutable, so the
-// fallback can never recurse; a missing or broken fallback degrades
-// to the built-in error page — never to a non-404
+// 404 with an optional custom error page (decision #17, renamed from
+// _404.eta in #18): when the document root contains a '.404.eta'
+// script it is rendered with a default status of 404 (the script may
+// override via RESP.status()). The dot convention keeps the file
+// itself unroutable, so the fallback can never recurse; a missing or
+// broken fallback degrades to the built-in error page — never to a
+// non-404
 async function sendNotFound (req, res, ctx, parsed, reqStart) {
-  const fb = path.join(ctx.root, '_404.eta')
+  const fb = path.join(ctx.root, '.404.eta')
   let st = null
   try {
     st = fs.statSync(fb)
@@ -894,7 +924,7 @@ async function sendNotFound (req, res, ctx, parsed, reqStart) {
     const real = realInside(ctx.rootReal, fb)
     if (real && !isSelfPath(real)) {
       return renderTemplate(req, res, ctx, parsed || fallbackParsed(req),
-        fb, '/_404.eta', '', reqStart,
+        fb, '/.404.eta', '', reqStart,
         { defaultStatus: 404, plain404OnError: true })
     }
   }
@@ -926,6 +956,11 @@ async function handleRequest (req, res, ctx) {
   } catch (e) {
     return sendNotFound(req, res, ctx, null, reqStart)
   }
+  // assigned right after the parse: every branch below can reach the
+  // 404 fallback template (NUL bytes, device names, ...), which
+  // expects the same _SERVER.QUERY_STRING contract as normal requests
+  parsed.queryString = (req.url.indexOf('?') >= 0)
+    ? req.url.slice(req.url.indexOf('?') + 1) : ''
   if (pathname.indexOf('\0') >= 0) {
     return sendNotFound(req, res, ctx, parsed, reqStart)
   }
@@ -952,8 +987,6 @@ async function handleRequest (req, res, ctx) {
       }
     }
   }
-  parsed.queryString = (req.url.indexOf('?') >= 0)
-    ? req.url.slice(req.url.indexOf('?') + 1) : ''
 
   const root = ctx.root
   let target = path.resolve(root, '.' + pathname)
@@ -981,10 +1014,11 @@ async function handleRequest (req, res, ctx) {
       pathInfo = pathname.slice(i + 4)
     }
   }
-  // ---- hidden-path convention (decision #17): checked on the file
-  // part only — the PATH_INFO tail of a real script is data, not a
-  // file path, so '/api.eta/_user/1' stays legal ----
+  // ---- hidden-path convention (decision #17/#18): checked on the
+  // file part only — the PATH_INFO tail of a real script is data, not
+  // a file path, so '/api.eta/.user/1' stays legal ----
   if (isPrivatePathname(scriptRel !== null ? scriptRel : pathname)) {
+    logBlocked(req)
     return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   if (scriptRel !== null) {
@@ -1001,8 +1035,11 @@ async function handleRequest (req, res, ctx) {
       // outside must not be rendered; a route whose real location is
       // the server's own file or a hidden name is 404 too
       const realScript = realInside(ctx.rootReal, scriptAbs)
-      if (!realScript || isSelfPath(realScript) ||
-        isPrivateReal(ctx.rootReal, realScript)) {
+      if (!realScript || isSelfPath(realScript)) {
+        return sendNotFound(req, res, ctx, parsed, reqStart)
+      }
+      if (isPrivateReal(ctx.rootReal, realScript)) {
+        logBlocked(req)
         return sendNotFound(req, res, ctx, parsed, reqStart)
       }
       return renderTemplate(req, res, ctx, parsed, scriptAbs, scriptRel,
@@ -1027,9 +1064,13 @@ async function handleRequest (req, res, ctx) {
   // a symlink / junction escaping the root is a plain 404 — as is any
   // route whose real location resolves to the server's own file (case-
   // insensitive everywhere, 8.3 short names expanded by realpath) or
-  // to a hidden name (a symlink pointing at '_private/' inside root)
+  // to a hidden name (a symlink pointing at '.config/' inside root)
   const real = realInside(ctx.rootReal, target)
-  if (!real || isSelfPath(real) || isPrivateReal(ctx.rootReal, real)) {
+  if (!real || isSelfPath(real)) {
+    return sendNotFound(req, res, ctx, parsed, reqStart)
+  }
+  if (isPrivateReal(ctx.rootReal, real)) {
+    logBlocked(req)
     return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   if (stat.isDirectory()) {
@@ -1048,8 +1089,11 @@ async function handleRequest (req, res, ctx) {
         // target inside the root escapes the containment check, so
         // isSelfPath is the only guard here)
         const realIdx = realInside(ctx.rootReal, idxEta)
-        if (!realIdx || isSelfPath(realIdx) ||
-          isPrivateReal(ctx.rootReal, realIdx)) {
+        if (!realIdx || isSelfPath(realIdx)) {
+          return sendNotFound(req, res, ctx, parsed, reqStart)
+        }
+        if (isPrivateReal(ctx.rootReal, realIdx)) {
+          logBlocked(req)
           return sendNotFound(req, res, ctx, parsed, reqStart)
         }
         const name = pathname + 'index.eta'
@@ -1062,8 +1106,11 @@ async function handleRequest (req, res, ctx) {
       try {
         if (fs.statSync(f).isFile()) {
           const realF = realInside(ctx.rootReal, f)
-          if (!realF || isSelfPath(realF) ||
-            isPrivateReal(ctx.rootReal, realF)) {
+          if (!realF || isSelfPath(realF)) {
+            return sendNotFound(req, res, ctx, parsed, reqStart)
+          }
+          if (isPrivateReal(ctx.rootReal, realF)) {
+            logBlocked(req)
             return sendNotFound(req, res, ctx, parsed, reqStart)
           }
           // Content-Type judged by the realpath extension (decision
@@ -1208,6 +1255,18 @@ function startServer (rootDir, port, host, options) {
   // access-log destination is per instance (on ctx), NOT a module
   // global: a second startServer() must not re-route the first one's
   // log. --quiet takes precedence over an explicit destination
+  const accessLog = options.quiet ? null : openAccessLog(options.accessLog)
+  // a file-stream destination must be released on BOTH shutdown paths:
+  // a listen failure (EADDRINUSE) and server.close() — otherwise
+  // repeated startServer() calls accumulate open handles (decision #18);
+  // stdout/stderr are shared process streams and never closed here
+  const ownsAccessLog = !!accessLog && accessLog !== process.stdout &&
+    accessLog !== process.stderr
+  const releaseAccessLog = () => {
+    if (ownsAccessLog) {
+      try { accessLog.end() } catch (e) { /* ignore */ }
+    }
+  }
   const ctx = {
     root: root,
     rootReal: fs.realpathSync(root),
@@ -1215,7 +1274,7 @@ function startServer (rootDir, port, host, options) {
     port: port,
     secret: deriveSecret(root),
     eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
-    accessLog: options.quiet ? null : openAccessLog(options.accessLog),
+    accessLog: accessLog,
   }
 
   // loopback binds are the intended usage; anything else deserves a
@@ -1242,8 +1301,13 @@ function startServer (rootDir, port, host, options) {
     })
   })
 
+  // 'close' fires once the server has fully shut down: release the
+  // access-log file stream with it
+  server.on('close', releaseAccessLog)
+
   return new Promise((resolve, reject) => {
     const onError = (err) => {
+      releaseAccessLog()     // the server never starts: drop the stream
       if (err.code === 'EADDRINUSE') {
         reject(new Error('port ' + port + ' is already in use on ' + host))
       } else {

@@ -142,8 +142,8 @@ Only erasable syntax is allowed (type annotations / interface / type / generics 
 ## Request semantics
 
 - Requesting `xxx.eta` renders it; non-`.eta` requests are served statically from a **built-in extension whitelist** (html, txt, css, js, json, common images, fonts, audio/video, pdf, wasm, archives — full list in the spec). Anything outside the whitelist is 404 (fail-closed).
-- **Hidden paths**: segments starting with `_` or `.`, and `node_modules`, are never served (404). Keep server-side libraries and config files behind such names — `_lib/util.ts`, `_config.json` — plain assets stay public.
-- **Custom 404 pages**: drop a `_404.eta` into the docroot and every 404 renders it (default status 404; the script may override).
+- **Hidden paths**: segments starting with `.`, and `node_modules` (any case), are never served (404); `.well-known` is exempt. Keep server-side libraries and config files behind dot names — `.lib/util.ts`, `.config.json` — plain assets and underscore build output (`_next/`) stay public. Every blocked request logs one stderr line, so a mysterious 404 is diagnosable at a glance.
+- **Custom 404 pages**: drop a `.404.eta` into the docroot and every 404 renders it (default status 404; the script may override).
 - Static files accept GET/HEAD only (others get 405); `.eta` scripts are rendered for all methods, with `REQUEST_METHOD` passed through.
 - Directories: a missing trailing slash gets a 301 redirect, then `index.eta` → `index.html` → `index.htm` is tried. A directory whose name contains `.eta` is served normally (the script/PATH_INFO split applies to files only).
 - `PATH_INFO`: requesting `hello.eta/foo/bar` renders `hello.eta` with `_SERVER.PATH_INFO = '/foo/bar'`.

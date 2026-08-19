@@ -187,25 +187,37 @@ async function main () {
       await res.text()
     })
 
-    await check('hidden paths: _ prefix, dotfiles, node_modules are 404',
-      async () => {
+    await check('hidden paths: dotfiles and node_modules (any case) 404, ' +
+      'underscore exports stay public', async () => {
         writeDemo('t_public.js', 'var x = 1')
-        writeDemo('_secret.js', 'module.exports = { DB_PASSWORD: "x" }')
-        writeDemo('_lib/config.json', '{"apiKey":"sk-live-secret-key"}')
         writeDemo('.hidden.txt', 'HIDDEN')
+        writeDemo('.config/db.json', '{"dbPassword":"x"}')
+        writeDemo('_next/static/app.js', 'var app = 1')
+        writeDemo('.well-known/token.txt', 'ACME-OK')
         const nm = path.join(ROOT, 'node_modules', 'pkg-data.json')
         fs.mkdirSync(path.dirname(nm), { recursive: true })
         fs.writeFileSync(nm, '{}')
         tmpDemoFiles.push(path.join(ROOT, 'node_modules'))
-        const ok = await fetch(BASE + '/t_public.js')
-        assert.strictEqual(ok.status, 200, 'plain lib.js stays public')
-        await ok.text()
-        for (const u of ['/_secret.js', '/_lib/config.json',
-          '/.hidden.txt', '/node_modules/pkg-data.json']) {
+        for (const u of ['/t_public.js', '/_next/static/app.js',
+          '/.well-known/token.txt']) {
+          const res = await fetch(BASE + u)
+          assert.strictEqual(res.status, 200, u + ' must stay public')
+          await res.text()
+        }
+        for (const u of ['/.hidden.txt', '/.config/db.json',
+          '/node_modules/pkg-data.json',
+          // case variants of the SAME directory: on win32 / APFS the
+          // file system opens them as 'node_modules' and realpath
+          // does not normalize case, so only a case-insensitive match
+          // catches them (fourth-review security fix)
+          '/Node_Modules/pkg-data.json', '/NODE_MODULES/pkg-data.json']) {
           const res = await fetch(BASE + u)
           assert.strictEqual(res.status, 404, u)
           await res.text()
         }
+        await new Promise(r => setTimeout(r, 100))
+        assert.ok(stderr.indexOf('blocked by hidden-path') >= 0,
+          'hidden-path blocks must be logged to stderr')
       })
 
     await check('server source 404 incl. case variants (root=package dir)',
@@ -280,10 +292,10 @@ async function main () {
     await check('PATH_INFO may contain hidden-looking segments', async () => {
       // the hidden-path convention checks the FILE part only; the
       // PATH_INFO tail is data, not a file path
-      const res = await fetch(BASE + '/hello.eta/_user/42')
+      const res = await fetch(BASE + '/hello.eta/.user/42')
       assert.strictEqual(res.status, 200)
       const body = await res.text()
-      assert.ok(body.indexOf('PATH_INFO   : /_user/42') >= 0)
+      assert.ok(body.indexOf('PATH_INFO   : /.user/42') >= 0)
     })
 
     await check('directory named *.eta falls back to normal serving',
@@ -715,9 +727,10 @@ async function main () {
       assert.strictEqual(await res.text(), '&lt;a&gt;&amp;')
     })
 
-    await check('RESP.status(0)/status("abc") give 500', async () => {
+    await check('RESP.status(0)/(100)/("abc") give 500', async () => {
       writeDemo('t_status0.eta', '<% RESP.status(0) %>x')
       writeDemo('t_statusabc.eta', '<% RESP.status("abc") %>x')
+      writeDemo('t_status100.eta', '<% RESP.status(100) %>x')
       const r1 = await fetch(BASE + '/t_status0.eta')
       assert.strictEqual(r1.status, 500)
       await r1.text()
@@ -725,6 +738,13 @@ async function main () {
       assert.strictEqual(r2.status, 500)
       const body = await r2.text()
       assert.ok(body.indexOf('invalid status') >= 0)
+      // 1xx is rejected: the buffered-body model has no meaningful
+      // interim response, and Node used to emit a fake Content-Length
+      // on a body it then dropped (decision #18)
+      const r3 = await fetch(BASE + '/t_status100.eta')
+      assert.strictEqual(r3.status, 500)
+      const body3 = await r3.text()
+      assert.ok(body3.indexOf('invalid status') >= 0)
     })
 
     await check('prototype-named query keys stay plain data', async () => {
@@ -772,18 +792,25 @@ async function main () {
       }
     })
 
-    await check('_404.eta fallback renders custom 404 pages', async () => {
-      writeDemo('_404.eta', 'CUSTOM-404:<%~ _SERVER.REQUEST_URI %>')
+    await check('.404.eta fallback renders custom 404 pages', async () => {
+      writeDemo('.404.eta',
+        'CUSTOM-404:<%~ _SERVER.REQUEST_URI %>' +
+        ':qs=<%~ typeof _SERVER.QUERY_STRING %>')
       const res = await fetch(BASE + '/definitely-missing')
       assert.strictEqual(res.status, 404)
       const body = await res.text()
-      assert.ok(body.indexOf('CUSTOM-404:/definitely-missing') >= 0)
+      assert.ok(body.indexOf('CUSTOM-404:/definitely-missing:qs=string') >= 0)
+      // early-404 branches (device names / NUL bytes) must expose
+      // QUERY_STRING to the fallback as well (decision #18)
+      const r0 = await fetch(BASE + '/NUL?a=1')
+      assert.strictEqual(r0.status, 404)
+      assert.ok((await r0.text()).indexOf(':qs=string') >= 0)
       // rejected paths keep the same status (fail-closed)
       const r2 = await fetch(BASE + '/tests/../eta-server.js')
       assert.strictEqual(r2.status, 404)
       await r2.text()
       // the fallback file itself is hidden: no recursion, still 404
-      const r3 = await fetch(BASE + '/_404.eta')
+      const r3 = await fetch(BASE + '/.404.eta')
       assert.strictEqual(r3.status, 404)
       await r3.text()
     })
@@ -913,6 +940,41 @@ async function main () {
         try { fs.rmSync(logA) } catch (e) { }
       }
     })
+
+    await check('aborted static download releases its fd (no leak)',
+      async () => {
+        // pipe() only unpipes when the client destroys the response;
+        // without an explicit destroy the stream never ends and the
+        // fd opened by sendStatic stays open (decision #18)
+        writeDemo('t_big.zip', 'x'.repeat(512 * 1024))
+        const mod = require(SERVER)
+        const portC = PORT + 6
+        const srv = await mod.startServer(ROOT, portC, '127.0.0.1',
+          { quiet: true })
+        let closes = 0
+        const origClose = fs.close
+        const origCloseSync = fs.closeSync
+        fs.close = function (...a) { closes++; return origClose.apply(fs, a) }
+        fs.closeSync = function (...a) { closes++; return origCloseSync.apply(fs, a) }
+        try {
+          const ctrl = new AbortController()
+          try {
+            const res = await fetch('http://127.0.0.1:' + portC +
+              '/t_big.zip', { signal: ctrl.signal })
+            const reader = res.body.getReader()
+            await reader.read()        // one chunk, then bail out
+            ctrl.abort()
+          } catch (e) { /* AbortError expected */ }
+          await new Promise(r => setTimeout(r, 400))
+          assert.ok(closes >= 1,
+            'fd not released after client abort (closes=' + closes + ')')
+        } finally {
+          fs.close = origClose
+          fs.closeSync = origCloseSync
+          if (srv.closeAllConnections) srv.closeAllConnections()
+          await new Promise(r => srv.close(r))
+        }
+      })
   } finally {
     for (const f of tmpDemoFiles) {
       try { fs.rmSync(f, { recursive: true, force: true }) } catch (e) { }

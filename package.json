@@ -1,6 +1,6 @@
 {
   "name": "eta-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "PHP-style dev server for .eta templates: file path is route, drop-in pages like .php",
   "main": "eta-server.js",
   "bin": {
