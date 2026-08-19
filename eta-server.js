@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/19 22:00:00
+ * Last Modified: 2026/08/19 23:30:00
  *
  * ===================================================================== */
 'use strict'
@@ -23,10 +23,11 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const os = require('node:os')
+const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.3.3'
+const VERSION = '0.4.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -34,12 +35,34 @@ const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
 // cookie is silently dropped by browsers anyway; fail loudly instead
 const SESSION_COOKIE_LIMIT = 4096
 const SELF_PATH = path.resolve(__filename)
-// realpath of our own file: realpath also expands 8.3 short names
-// (ETASE~1.JS), so comparing resolved paths covers them. Note
-// realpathSync does NOT normalize case on case-insensitive file
-// systems, hence isSelfPath() below compares case-insensitively
+
+// canonical realpath (decision #20). fs.realpathSync — the JS
+// implementation, which is what the plain name resolves to — walks the
+// path with lstat/readlink: it resolves symlinks but canonicalizes
+// NEITHER win32 8.3 short names ('NODE_M~1' opens 'node_modules',
+// 'ETA-SE~1.JS' opens 'eta-server.js') NOR case. Every check that runs
+// on a realpath result therefore used to see the alias and miss it, so
+// one filesystem-level naming trick walked straight through both
+// self-protection and the hidden-path convention. fs.realpathSync.native
+// goes through GetFinalPathNameByHandle and hands back the true long
+// name in its on-disk case, which kills the whole aliasing family at
+// the root instead of one alias at a time. The JS implementation stays
+// as a fallback for the exotic paths native rejects; when it throws too
+// the caller (realInside) fails closed
+function realpathCanon (p) {
+  try {
+    return fs.realpathSync.native(p)
+  } catch (e) {
+    return fs.realpathSync(p)
+  }
+}
+
+// realpath of our own file, canonical: 8.3 short names and case are
+// both resolved here. isSelfPath() still folds case on top of that —
+// the dispatcher fast path compares a target that has NOT been through
+// realpath, and the case fold is the only thing catching it there
 const SELF_PATH_REAL = (() => {
-  try { return fs.realpathSync(SELF_PATH) } catch (e) { return SELF_PATH }
+  try { return realpathCanon(SELF_PATH) } catch (e) { return SELF_PATH }
 })()
 
 // self-protection predicate: case-insensitive on EVERY platform, not
@@ -231,7 +254,10 @@ function loadMasterSecret () {
 function deriveSecret (rootDir) {
   let rootReal = ''
   try {
-    rootReal = fs.realpathSync(rootDir)
+    // canonical form (decision #20): the plain realpath keeps whatever
+    // case the caller typed, so '-r E:\www' and '-r e:\WWW' derived two
+    // different keys for one site and dropped every session on restart
+    rootReal = realpathCanon(rootDir)
   } catch (e) {
     rootReal = path.resolve(rootDir)
   }
@@ -280,7 +306,10 @@ function decodeSession (cookie, secret) {
   if (!payload || typeof payload.e !== 'number') return null
   if (payload.e < Date.now()) return null
   if (!payload.d || typeof payload.d !== 'object') return null
-  return payload.d
+  // null-prototype like every other bridge dict (decision #14 parity):
+  // JSON.parse hands back an Object.prototype-backed object, which made
+  // _SESSION the only dict where inherited members shine through
+  return Object.assign(Object.create(null), payload.d)
 }
 
 function parseCookies (header) {
@@ -398,11 +427,24 @@ function trackWriteHead (res, state) {
   }
 }
 
+// CLF wraps the request line in double quotes, so a literal '"' (or a
+// backslash) inside the request target splits the field and every
+// downstream parser (awk / goaccess) misreads the line — an attacker
+// picks the URL, hence picks what the fields look like. Apache escapes
+// both as \" / \\ and so do we (decision #20; the third review had
+// marked this channel clean, the seventh reproduced it: GET /a"b logged
+// an unescaped quote). Control characters need no handling — llhttp
+// rejects them in the request line, so no full line injection exists
+function clfEscape (value) {
+  return String(value).replace(/[\\"]/g, (c) => '\\' + c)
+}
+
 function accessLine (req, res, state, start) {
   const remote = (req.socket && req.socket.remoteAddress) || '-'
   const ms = Date.now() - start
   return remote + ' - - [' + formatCltTime(new Date(start)) + '] "' +
-    req.method + ' ' + req.url + ' HTTP/' + req.httpVersion + '" ' +
+    clfEscape(req.method) + ' ' + clfEscape(req.url) +
+    ' HTTP/' + req.httpVersion + '" ' +
     res.statusCode + ' ' + responseBytes(state) + ' ' + ms + 'ms'
 }
 
@@ -417,6 +459,66 @@ function openAccessLog (spec) {
     console.error('eta-server: access log write error: ' + err.message)
   })
   return stream
+}
+
+/* ---------------------------------------------------------------------
+ * Host header allowlist — DNS rebinding defense (decision #20)
+ * ------------------------------------------------------------------- */
+
+// A loopback bind is NOT an access control: any page the developer
+// happens to visit can point a hostname it controls at 127.0.0.1 (a
+// short-TTL DNS rebind), and the browser will then treat this server as
+// same-origin with the attacker's page — so it may not only send
+// requests but READ the responses. SameSite=Lax does not help (it is
+// same-site after the rebind), CORS does not help (nothing is
+// cross-origin any more), and the "local / trusted environment"
+// positioning does not help either: the attacker is remote while the
+// victim's own browser makes the request. The only real defense is to
+// check the Host header, which is why vite / webpack-dev-server /
+// angular all ship an allowlist. Accepted by default: loopback names,
+// any *.localhost (RFC 6761), the bind address, and every literal IP.
+function hostnameOf (hostHeader) {
+  let h = String(hostHeader || '').trim()
+  if (!h) return ''
+  if (h.charAt(0) === '[') {                 // [::1]:5000 -> ::1
+    const i = h.indexOf(']')
+    return i > 0 ? h.slice(1, i).toLowerCase() : ''
+  }
+  const i = h.lastIndexOf(':')
+  // one colon only = host:port; several = a bare IPv6 literal, keep it
+  if (i >= 0 && h.indexOf(':') === i) h = h.slice(0, i)
+  return h.toLowerCase()
+}
+
+// null means "check disabled" (--allowed-hosts all)
+function buildAllowedHosts (host, spec) {
+  const s = spec ? String(spec).trim() : ''
+  if (s === 'all' || s === '*') return null
+  const out = Object.assign(Object.create(null), {
+    'localhost': 1, 'localhost.localdomain': 1,
+  })
+  const add = (v) => { const n = hostnameOf(v); if (n) out[n] = 1 }
+  add(host)
+  if (s) for (const item of s.split(',')) add(item)
+  return out
+}
+
+function isHostAllowed (allowed, hostHeader) {
+  if (allowed === null) return true
+  const name = hostnameOf(hostHeader)
+  // no Host at all (HTTP/1.0 client, hand-written curl): browsers
+  // always send one, so this is never the rebinding channel
+  if (name === '') return true
+  // a literal IP cannot be rebound — the browser sends the name it
+  // navigated to, and a DNS *name* is the only thing an attacker
+  // controls, so an IP Host is authentic by construction. Keeps LAN
+  // access through -H 0.0.0.0 working without configuration
+  if (net.isIP(name) !== 0) return true
+  if (allowed[name]) return true
+  // RFC 6761 reserves .localhost for the loopback: 'myapp.localhost'
+  // reaches this server with no DNS involved at all
+  if (name.endsWith('.localhost')) return true
+  return false
 }
 
 /* ---------------------------------------------------------------------
@@ -446,11 +548,14 @@ function containsPath (root, p) {
 
 // realpath containment: resolve symlinks / junctions, reject anything
 // whose real location lives outside the real document root. Returns
-// the real path, or null when missing / escaping.
+// the real path in canonical form (8.3 short names expanded, case
+// normalized — see realpathCanon), or null when missing / escaping.
+// Every caller feeds this result to isSelfPath / isPrivateReal, so the
+// canonicalization here is what makes those two rules alias-proof
 function realInside (rootReal, abs) {
   let real = null
   try {
-    real = fs.realpathSync(abs)
+    real = realpathCanon(abs)
   } catch (e) {
     return null
   }
@@ -504,6 +609,33 @@ function isPrivateReal (rootReal, real) {
   return isPrivatePathname('/' + rel.split(path.sep).join('/'))
 }
 
+// THE gate: every filesystem path the dispatcher is about to serve goes
+// through here, and nothing is served without its return value. Returns
+// the canonical real path, or null when the candidate escapes the root,
+// resolves to the server's own file, or lands under a private name
+// (that last case logs one stderr line, the others stay silent —
+// fail-closed 404 is indistinguishable from "does not exist").
+//
+// This used to be three calls written out at four call sites (template
+// branch, directory/static branch, index.eta candidate, index.html
+// candidates), and the copies are why the same class of hole kept
+// coming back: decision #15 found the index candidates missing their
+// isSelfPath check, decision #18 found a new rule that had only landed
+// in some copies, decision #20 found an aliasing bug that had to be
+// fixed in every copy at once. One chokepoint means a rule is written
+// once. The single deliberate exception is the .404.eta lookup in
+// sendNotFound(), which must bypass the private-name rule because the
+// fallback page is a dot file by design — spelled out there.
+function gateReal (req, rootReal, abs) {
+  const real = realInside(rootReal, abs)
+  if (!real || isSelfPath(real)) return null
+  if (isPrivateReal(rootReal, real)) {
+    logBlocked(req)
+    return null
+  }
+  return real
+}
+
 /* ---------------------------------------------------------------------
  * response control object injected into templates as RESP
  * ------------------------------------------------------------------- */
@@ -514,7 +646,7 @@ function makeResp (defaultStatus) {
     // script may still override with RESP.status()
     code: defaultStatus || 200,
     headers: [],                 // list of [name, value] pairs
-    binary: null,                // writeraw buffer, null until touched
+    binary: null,                // writeraw chunk list, null until touched
     text: null,                  // RESP.json() body, null until set
     header: function (name, value) {
       const n = String(name)
@@ -586,8 +718,12 @@ function makeResp (defaultStatus) {
       if (!Buffer.isBuffer(chunk) && !(chunk instanceof Uint8Array)) {
         throw new TypeError('RESP.writeraw() only accepts bytes')
       }
-      const buf = Buffer.from(chunk)
-      resp.binary = resp.binary ? Buffer.concat([resp.binary, buf]) : buf
+      // chunks accumulate in a list and are joined once at assembly
+      // time: concatenating on every call copied the whole buffer each
+      // time, i.e. O(n^2) bytes for a template streaming out an image
+      // in pieces (decision #20)
+      if (resp.binary === null) resp.binary = []
+      resp.binary.push(Buffer.from(chunk))
     },
     write: function () {
       // no-op alias: in eta, output goes through template text / <%= %>
@@ -662,7 +798,12 @@ function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx,
     REMOTE_ADDR: req.socket.remoteAddress || '',
     CONTENT_TYPE: headers['content-type'] || '',
     CONTENT_LENGTH: headers['content-length'] || '',
-    SERVER_NAME: ctx.host,
+    // CGI / PHP semantics: SERVER_NAME is the name the client asked
+    // for, not the bind address (which reported a useless '0.0.0.0'
+    // under -H 0.0.0.0). Safe to trust now that the Host header passes
+    // the allowlist first (decision #20); the bind address remains the
+    // fallback for clients that send no Host at all
+    SERVER_NAME: hostnameOf(headers['host']) || ctx.host,
     SERVER_PORT: String(ctx.port),
     REQUEST_SCHEME: 'http',
     SERVER_PROTOCOL: 'HTTP/' + (req.httpVersion || '1.1'),
@@ -683,6 +824,16 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   try {
     bodyBuf = await readBody(req)
   } catch (err) {
+    if (opts.plain404OnError) {
+      // the "a fallback page never turns a 404 into anything else"
+      // promise covers the body read too, not just rendering: an
+      // over-cap POST to a missing path used to answer 413 from the
+      // .404.eta path (decision #20, the fourth hole in that family)
+      console.error('eta-server: fallback page body read failed (' +
+        ((err && err.message) || err) +
+        '), degrading to the built-in 404')
+      return sendError(res, 404, 'Not Found')
+    }
     if (err.status === 413) {
       return sendError(res, 413, 'Payload Too Large', err.message)
     }
@@ -777,8 +928,13 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   // silently discard the reassignment ----
   let sessionOut = session
   if (data._SESSION !== session) {
-    if (data._SESSION === null || data._SESSION === undefined) {
-      sessionOut = {}                       // null clears the session
+    if (data._SESSION === null || data._SESSION === undefined ||
+      data._SESSION === false) {
+      // the three ways people write "no session"; every other
+      // primitive is a mistake and gets warned about below. `false`
+      // used to fall into that warning despite the docs listing it
+      // as a clear (decision #20)
+      sessionOut = {}
     } else if (typeof data._SESSION === 'object') {
       sessionOut = data._SESSION            // {} / [] / new dict
     } else {
@@ -888,10 +1044,17 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     headers['Content-Type'] = 'text/html; charset=utf-8'
   }
 
+  // "edits take effect immediately" (decision #1) is only true of the
+  // server: a response carrying neither Cache-Control nor Last-Modified
+  // is fair game for the browser's heuristic cache, so an unchanged URL
+  // could still answer from disk. no-store by default, and templates
+  // wanting real caching just set the header themselves (decision #20)
+  if (!hmap.has('cache-control')) headers['Cache-Control'] = 'no-store'
+
   // ---- pick body: binary short-circuit > RESP.json() > rendered html ----
   let body = html
   if (resp.binary !== null) {
-    body = resp.binary
+    body = Buffer.concat(resp.binary)       // writeraw chunk list
   } else if (resp.text !== null) {
     body = resp.text
   }
@@ -933,7 +1096,10 @@ function sendStatic (req, res, abs, type) {
   }
   res.writeHead(200, {
     'Content-Type': type,
-    'Content-Length': stat.size
+    'Content-Length': stat.size,
+    // same reason as the template branch: a dev server must not let
+    // the browser heuristically cache an asset it is about to re-edit
+    'Cache-Control': 'no-store'
   })
   if (req.method === 'HEAD') {
     try { fs.closeSync(fd) } catch (e) { /* ignore */ }
@@ -982,6 +1148,11 @@ async function sendNotFound (req, res, ctx, parsed, reqStart) {
     st = fs.statSync(fb)
   } catch (e) { /* no fallback */ }
   if (st && st.isFile()) {
+    // the one deliberate exception to gateReal(): the fallback page is
+    // a dot file by design, so the private-name rule would reject the
+    // very file this branch exists to render. Containment and
+    // self-protection still apply — a '.404.eta' symlinked out of the
+    // root, or at the server's own source, is not rendered
     const real = realInside(ctx.rootReal, fb)
     if (real && !isSelfPath(real)) {
       return renderTemplate(req, res, ctx, parsed || fallbackParsed(req),
@@ -996,6 +1167,25 @@ async function handleRequest (req, res, ctx) {
   // PHP semantics: REQUEST_TIME marks request arrival, captured before
   // the body upload (which can take a while for big POSTs)
   const reqStart = Date.now()
+  // ---- Host allowlist, before anything else touches the path: a
+  // foreign Host means the request arrived through a name this server
+  // was never reached by, i.e. a DNS rebind (decision #20). 403 with a
+  // pointer to the flag rather than the fail-closed 404 used elsewhere:
+  // this one is a configuration problem, and a silent 404 would be
+  // undebuggable for someone running behind a custom dev hostname ----
+  if (!isHostAllowed(ctx.allowedHosts, req.headers['host'])) {
+    const host = String(req.headers['host'])
+    console.error('eta-server: blocked by host allowlist: "' + host +
+      '" (' + req.method + ' ' + req.url + ')')
+    return sendError(res, 403, 'Forbidden',
+      'Host header "' + host + '" is not on the allowlist.\n\n' +
+      'This dev server answers to loopback names, *.localhost, literal\n' +
+      'IP addresses and its own bind address only, so a remote page\n' +
+      'cannot reach it by pointing a hostname at 127.0.0.1.\n\n' +
+      'Serving a custom hostname on purpose? Start the server with\n' +
+      '  --allowed-hosts ' + hostnameOf(host) + '\n' +
+      'or turn the check off entirely with --allowed-hosts all.')
+  }
   // ---- slash merging: //a///b -> 308 /a/b (checked on the raw URL
   // first, because new URL() would treat a leading '//' as
   // protocol-relative and misparse the host part) ----
@@ -1092,15 +1282,10 @@ async function handleRequest (req, res, ctx) {
       stat = fs.statSync(scriptAbs)
     } catch (e) { /* handled below */ }
     if (stat && stat.isFile()) {
-      // realpath containment: a symlink / junction inside root pointing
-      // outside must not be rendered; a route whose real location is
-      // the server's own file or a hidden name is 404 too
-      const realScript = realInside(ctx.rootReal, scriptAbs)
-      if (!realScript || isSelfPath(realScript)) {
-        return sendNotFound(req, res, ctx, parsed, reqStart)
-      }
-      if (isPrivateReal(ctx.rootReal, realScript)) {
-        logBlocked(req)
+      // a symlink / junction inside root pointing outside must not be
+      // rendered; neither may a route whose real location is the
+      // server's own file or a hidden name
+      if (!gateReal(req, ctx.rootReal, scriptAbs)) {
         return sendNotFound(req, res, ctx, parsed, reqStart)
       }
       return renderTemplate(req, res, ctx, parsed, scriptAbs, scriptRel,
@@ -1121,17 +1306,12 @@ async function handleRequest (req, res, ctx) {
   } catch (e) {
     return sendNotFound(req, res, ctx, parsed, reqStart)
   }
-  // realpath containment applies to both directories and static files:
-  // a symlink / junction escaping the root is a plain 404 — as is any
-  // route whose real location resolves to the server's own file (case-
-  // insensitive everywhere, 8.3 short names expanded by realpath) or
-  // to a hidden name (a symlink pointing at '.config/' inside root)
-  const real = realInside(ctx.rootReal, target)
-  if (!real || isSelfPath(real)) {
-    return sendNotFound(req, res, ctx, parsed, reqStart)
-  }
-  if (isPrivateReal(ctx.rootReal, real)) {
-    logBlocked(req)
+  // the gate applies to both directories and static files: a symlink /
+  // junction escaping the root is a plain 404 — as is any route whose
+  // real location resolves to the server's own file or to a hidden name
+  // (a symlink pointing at '.config/' inside root)
+  const real = gateReal(req, ctx.rootReal, target)
+  if (!real) {
     return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   if (stat.isDirectory()) {
@@ -1144,17 +1324,12 @@ async function handleRequest (req, res, ctx) {
     const idxEta = path.join(real, 'index.eta')
     try {
       if (fs.statSync(idxEta).isFile()) {
-        // index candidates get their own containment check: the
+        // index candidates go through the gate on their own: the
         // directory passed, but an index symlink inside it may still
-        // point outside the root — or at the server's own file (a
-        // target inside the root escapes the containment check, so
-        // isSelfPath is the only guard here)
-        const realIdx = realInside(ctx.rootReal, idxEta)
-        if (!realIdx || isSelfPath(realIdx)) {
-          return sendNotFound(req, res, ctx, parsed, reqStart)
-        }
-        if (isPrivateReal(ctx.rootReal, realIdx)) {
-          logBlocked(req)
+        // point outside the root — or at the server's own file, which
+        // the containment check cannot catch because the target is
+        // inside the root
+        if (!gateReal(req, ctx.rootReal, idxEta)) {
           return sendNotFound(req, res, ctx, parsed, reqStart)
         }
         const name = pathname + 'index.eta'
@@ -1166,12 +1341,8 @@ async function handleRequest (req, res, ctx) {
       const f = path.join(real, name)
       try {
         if (fs.statSync(f).isFile()) {
-          const realF = realInside(ctx.rootReal, f)
-          if (!realF || isSelfPath(realF)) {
-            return sendNotFound(req, res, ctx, parsed, reqStart)
-          }
-          if (isPrivateReal(ctx.rootReal, realF)) {
-            logBlocked(req)
+          const realF = gateReal(req, ctx.rootReal, f)
+          if (!realF) {
             return sendNotFound(req, res, ctx, parsed, reqStart)
           }
           // Content-Type judged by the realpath extension (decision
@@ -1293,7 +1464,7 @@ async function renderCli (script, args) {
   // short-circuit > RESP.json() > rendered text
   let body = html
   if (resp.binary !== null) {
-    body = resp.binary
+    body = Buffer.concat(resp.binary)       // writeraw chunk list
   } else if (resp.text !== null) {
     body = resp.text
   }
@@ -1328,14 +1499,28 @@ function startServer (rootDir, port, host, options) {
       try { accessLog.end() } catch (e) { /* ignore */ }
     }
   }
+  // null = check disabled; immutable startup config like every other
+  // ctx member (decision #14)
+  const allowedHosts = buildAllowedHosts(host, options.allowedHosts)
+
   const ctx = {
     root: root,
-    rootReal: fs.realpathSync(root),
+    // canonical: containment and the hidden-path rule compare relative
+    // paths against this, so it must be produced by the same resolver
+    // as every realInside() result (decision #20)
+    rootReal: realpathCanon(root),
     host: host,
     port: port,
     secret: deriveSecret(root),
     eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
     accessLog: accessLog,
+    allowedHosts: allowedHosts,
+  }
+
+  if (allowedHosts === null) {
+    console.error('eta-server: warning: Host allowlist disabled ' +
+      '(--allowed-hosts all) — any web page the browser visits can now ' +
+      'reach this server through a rebound DNS name and read the responses')
   }
 
   // loopback binds are the intended usage; anything else deserves a
@@ -1408,6 +1593,10 @@ function printHelp () {
   console.log('  -q, --quiet         no access log (HTTP mode only)')
   console.log('  --access-log <p>    write the access log to <p>, appending;')
   console.log('                      "-" means stdout (default: stderr)')
+  console.log('  --allowed-hosts <l> extra Host names to accept, comma')
+  console.log('                      separated (default: loopback names,')
+  console.log('                      *.localhost, literal IPs and the bind')
+  console.log('                      address); "all" disables the check')
   console.log('  -h, --help          show this help')
   console.log('')
   console.log('CLI mode:')
@@ -1418,7 +1607,7 @@ function printHelp () {
 
 function parseArgs (argv) {
   const opts = { root: process.cwd(), port: 5000, host: '127.0.0.1',
-    quiet: false, accessLog: null,
+    quiet: false, accessLog: null, allowedHosts: null,
     script: null, args: [] }
   const args = argv.slice(2)
   for (let i = 0; i < args.length; i++) {
@@ -1441,6 +1630,9 @@ function parseArgs (argv) {
     } else if (a === '--access-log') {
       if (i + 1 >= args.length) throw new Error('missing value for ' + a)
       opts.accessLog = args[++i]
+    } else if (a === '--allowed-hosts') {
+      if (i + 1 >= args.length) throw new Error('missing value for ' + a)
+      opts.allowedHosts = args[++i]
     } else if (a === '-h' || a === '--help') {
       printHelp()
       process.exit(0)
@@ -1485,6 +1677,7 @@ if (require.main === module) {
     })
     startServer(opts.root, opts.port, opts.host, {
       quiet: opts.quiet, accessLog: opts.accessLog,
+      allowedHosts: opts.allowedHosts,
     }).then((server) => {
       printBanner(path.resolve(opts.root), opts.port, opts.host)
       const shutdown = () => {

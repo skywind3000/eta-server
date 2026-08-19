@@ -15,6 +15,8 @@
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
+const net = require('node:net')
+const http = require('node:http')
 const path = require('node:path')
 const assert = require('node:assert')
 
@@ -50,6 +52,42 @@ function writeDemo (name, text) {
   fs.writeFileSync(p, text)
   tmpDemoFiles.push(p)
   return p
+}
+
+// GET with a hand-written Host header: fetch() treats Host as a
+// forbidden header and silently keeps its own, so the rebinding probes
+// have to go through node:http
+function rawGet (port, hostHeader, urlPath) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port: port, path: urlPath, method: 'GET',
+      headers: { Host: hostHeader },
+    }, (res) => {
+      let body = ''
+      res.on('data', (c) => { body += c.toString() })
+      res.on('end', () => resolve({
+        status: res.statusCode, headers: res.headers, body: body,
+      }))
+    })
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+// hand-written request line: every URL parser on the way percent-
+// encodes the interesting characters, so a literal '"' only reaches
+// the server through a raw socket
+function rawLine (port, line) {
+  return new Promise((resolve) => {
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(line + '\r\nHost: 127.0.0.1:' + port +
+        '\r\nConnection: close\r\n\r\n')
+    })
+    let buf = ''
+    sock.on('data', (c) => { buf += c.toString() })
+    sock.on('close', () => resolve(buf))
+    sock.on('error', () => resolve(buf))
+  })
 }
 
 async function check (name, fn) {
@@ -244,6 +282,21 @@ async function main () {
             await res.text()
             assert.strictEqual(res.status, 404, name)
           }
+          // the win32 8.3 alias of the self file: fs.realpathSync does
+          // not expand short names, so before decision #20 this route
+          // downloaded the whole server source with a 200. Only volumes
+          // with short-name creation enabled generate the alias
+          const alias83 = path.join(pkgRoot, 'ETA-SE~1.JS')
+          if (process.platform === 'win32' && fs.existsSync(alias83)) {
+            const rs = await fetch(BASE2 + '/ETA-SE~1.JS')
+            const bodyS = await rs.text()
+            assert.strictEqual(rs.status, 404, 'ETA-SE~1.JS alias')
+            assert.ok(bodyS.indexOf('usr/bin/env node') < 0,
+              'server source leaked through its 8.3 alias')
+          } else {
+            skip('self file 8.3 alias probe',
+              'no 8.3 short name for eta-server.js on this volume')
+          }
           // root itself is functional: only the self file is blocked
           const ok = await fetch(BASE2 + '/package.json')
           assert.strictEqual(ok.status, 200)
@@ -420,6 +473,27 @@ async function main () {
         assert.strictEqual(await r4.text(), '1')
       })
 
+    await check('_SESSION = false clears the session like {} / null',
+      async () => {
+        // the docs listed false among the clearing values but the code
+        // only handled null / undefined and warned about the rest
+        writeDemo('t_sessc2.eta',
+          '<% _SESSION.n = (_SESSION.n || 0) + 1 %><%~ _SESSION.n %>')
+        writeDemo('t_sessfalse.eta', '<% _SESSION = false %>cleared')
+        const r1 = await fetch(BASE + '/t_sessc2.eta')
+        assert.strictEqual(await r1.text(), '1')
+        const c1 = getSessionCookie(r1)
+        assert.ok(c1)
+        const r2 = await fetch(BASE + '/t_sessfalse.eta',
+          { headers: { Cookie: c1 } })
+        assert.strictEqual(await r2.text(), 'cleared')
+        const all = r2.headers.getSetCookie ? r2.headers.getSetCookie() : []
+        const cleared = all.filter((c) => c.startsWith('etasess=') &&
+          c.indexOf('Max-Age=0') >= 0)
+        assert.strictEqual(cleared.length, 1,
+          '_SESSION = false must emit the Max-Age=0 clear')
+      })
+
     await check('require() demo works (node:path)', async () => {
       const res = await fetch(BASE + '/require.eta')
       assert.strictEqual(res.status, 200)
@@ -557,6 +631,127 @@ async function main () {
       assert.strictEqual(res.status, 308)
       assert.strictEqual(res.headers.get('location'), '/sub/index.html')
     })
+
+    await check('8.3 short names cannot bypass the hidden-path convention',
+      async () => {
+        // fs.realpathSync resolves symlinks but not win32 short names,
+        // so /NODE_M~1/x.json and /LIB~1/util.js used to serve hidden
+        // files with a 200 while their long names 404'd (decision #20).
+        // tmpdir sits on the system volume, where short-name creation
+        // is usually ON; project volumes often have it off, hence the
+        // per-alias existence probe below
+        if (process.platform !== 'win32') {
+          skip('8.3 short-name bypass probe', 'win32 only')
+          return
+        }
+        const root83 = fs.mkdtempSync(path.join(os.tmpdir(), 'eta-83-'))
+        fs.mkdirSync(path.join(root83, 'node_modules'))
+        fs.writeFileSync(path.join(root83, 'node_modules', 'pkg.json'),
+          '{"dbPassword":"SECRET-NM"}')
+        fs.mkdirSync(path.join(root83, '.lib'))
+        fs.writeFileSync(path.join(root83, '.lib', 'util.js'), 'SECRET-LIB')
+        fs.writeFileSync(path.join(root83, '.h83.txt'), 'SECRET-DOTFILE')
+        // echoes which script rendered it: a 404 legitimately renders
+        // this page, so only SCRIPT_NAME can tell "reached as the
+        // fallback" from "routed directly through its 8.3 alias"
+        fs.writeFileSync(path.join(root83, '.404.eta'),
+          'FB:<%~ _SERVER.SCRIPT_NAME %>')
+        fs.writeFileSync(path.join(root83, 'index.eta'), 'ok')
+        // aliases this volume actually generated, keyed by the first
+        // segment (that is what has to exist for the probe to mean
+        // anything) plus the string that must NOT come back
+        const aliases = [
+          ['/NODE_M~1/pkg.json', 'NODE_M~1', 'SECRET-NM'],
+          ['/LIB~1/util.js', 'LIB~1', 'SECRET-LIB'],
+          ['/H83~1.TXT', 'H83~1.TXT', 'SECRET-DOTFILE'],
+          ['/404~1.ETA', '404~1.ETA', '404~1.ETA'],
+        ].filter((a) => fs.existsSync(path.join(root83, a[1])))
+        if (aliases.length === 0) {
+          fs.rmSync(root83, { recursive: true, force: true })
+          skip('8.3 short-name bypass probe',
+            'volume has no 8.3 short names (NtfsDisable8dot3NameCreation)')
+          return
+        }
+        const mod = require(SERVER)
+        const port83 = PORT + 7
+        const srv83 = await mod.startServer(root83, port83, '127.0.0.1',
+          { quiet: true })
+        try {
+          for (const item of aliases) {
+            const res = await fetch('http://127.0.0.1:' + port83 + item[0])
+            const body = await res.text()
+            assert.strictEqual(res.status, 404, item[0])
+            assert.ok(body.indexOf(item[2]) < 0,
+              item[0] + ' served "' + item[2] + '" through its 8.3 alias')
+          }
+          // the docroot is otherwise functional
+          const ok = await fetch('http://127.0.0.1:' + port83 + '/index.eta')
+          assert.strictEqual(ok.status, 200)
+          await ok.text()
+        } finally {
+          if (srv83.closeAllConnections) srv83.closeAllConnections()
+          await new Promise(r => srv83.close(r))
+          fs.rmSync(root83, { recursive: true, force: true })
+        }
+      })
+
+    // ==================== Host allowlist (decision #20) ====================
+
+    await check('foreign Host is rejected (DNS rebinding defense)',
+      async () => {
+        const bad = await rawGet(PORT, 'attacker.example', '/index.eta')
+        assert.strictEqual(bad.status, 403)
+        assert.ok(bad.body.indexOf('allowlist') >= 0)
+        // the 403 must name the escape hatch: a bare 404 here would be
+        // undebuggable for a custom dev hostname
+        assert.ok(bad.body.indexOf('--allowed-hosts') >= 0)
+        // loopback names, *.localhost and literal IPs stay usable
+        for (const h of ['127.0.0.1:' + PORT, 'localhost:' + PORT,
+          'myapp.localhost:' + PORT, '[::1]:' + PORT, '192.168.1.9:' + PORT]) {
+          const ok = await rawGet(PORT, h, '/index.eta')
+          assert.strictEqual(ok.status, 200, h)
+        }
+        await new Promise(r => setTimeout(r, 100))
+        assert.ok(stderr.indexOf('blocked by host allowlist') >= 0,
+          'host allowlist blocks must be logged to stderr')
+      })
+
+    await check('--allowed-hosts extends the list, "all" disables it',
+      async () => {
+        const mod = require(SERVER)
+        const portD = PORT + 8
+        const portE = PORT + 9
+        const srvD = await mod.startServer(ROOT, portD, '127.0.0.1',
+          { quiet: true, allowedHosts: 'dev.example,other.test' })
+        const srvE = await mod.startServer(ROOT, portE, '127.0.0.1',
+          { quiet: true, allowedHosts: 'all' })
+        try {
+          assert.strictEqual(
+            (await rawGet(portD, 'dev.example', '/index.eta')).status, 200)
+          assert.strictEqual(
+            (await rawGet(portD, 'other.test:1234', '/index.eta')).status, 200)
+          assert.strictEqual(
+            (await rawGet(portD, 'evil.example', '/index.eta')).status, 403)
+          assert.strictEqual(
+            (await rawGet(portE, 'evil.example', '/index.eta')).status, 200)
+        } finally {
+          if (srvD.closeAllConnections) srvD.closeAllConnections()
+          if (srvE.closeAllConnections) srvE.closeAllConnections()
+          await new Promise(r => srvD.close(r))
+          await new Promise(r => srvE.close(r))
+        }
+      })
+
+    await check('access log escapes quotes inside the request line',
+      async () => {
+        // CLF quotes the request line, so an unescaped '"' in the URL
+        // splits the field and every log parser downstream misreads it
+        const out = await rawLine(PORT, 'GET /t_q"uote.txt HTTP/1.1')
+        assert.ok(out.indexOf('HTTP/1.1 4') >= 0, 'expected a 4xx response')
+        await new Promise(r => setTimeout(r, 120))
+        assert.ok(stderr.indexOf('"GET /t_q\\"uote.txt HTTP/1.1"') >= 0,
+          'a quote in the request target must be logged as \\"')
+      })
 
     // ==================== bridge / _SERVER parity ====================
 
@@ -772,6 +967,40 @@ async function main () {
         assert.strictEqual(await ok.text(), 'ok')
       })
 
+    await check('Cache-Control: no-store by default, template wins',
+      async () => {
+        writeDemo('t_cc.eta', '<% RESP.header("Cache-Control", "max-age=60") %>ok')
+        const r1 = await fetch(BASE + '/hello.eta')
+        await r1.text()
+        assert.strictEqual(r1.headers.get('cache-control'), 'no-store',
+          'rendered pages must not be heuristically cacheable')
+        const r2 = await fetch(BASE + '/style.css')
+        await r2.text()
+        assert.strictEqual(r2.headers.get('cache-control'), 'no-store',
+          'static assets must not be heuristically cacheable')
+        const r3 = await fetch(BASE + '/t_cc.eta')
+        await r3.text()
+        assert.strictEqual(r3.headers.get('cache-control'), 'max-age=60')
+      })
+
+    await check('writeraw chunks keep their order', async () => {
+      writeDemo('t_raw.eta',
+        '<% for (const s of ["a", "b", "c"]) RESP.writeraw(Buffer.from(s)) %>' +
+        'discarded')
+      const res = await fetch(BASE + '/t_raw.eta')
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(await res.text(), 'abc')
+    })
+
+    await check('SERVER_NAME comes from the Host header', async () => {
+      // CGI semantics: the name the client asked for, not the bind
+      // address (which answered a useless '0.0.0.0' under -H 0.0.0.0)
+      writeDemo('t_srvname.eta', '<%~ _SERVER.SERVER_NAME %>')
+      const r = await rawGet(PORT, 'myapp.localhost:' + PORT, '/t_srvname.eta')
+      assert.strictEqual(r.status, 200)
+      assert.strictEqual(r.body, 'myapp.localhost')
+    })
+
     await check('prototype-named query keys stay plain data', async () => {
       const res = await fetch(BASE +
         '/api.eta?__proto__=pwned&constructor=c&hasOwnProperty=h')
@@ -872,6 +1101,17 @@ async function main () {
       assert.strictEqual(res.status, 413)
       const body = await res.text()
       assert.ok(body.indexOf('Payload Too Large') >= 0)
+      // ...but a .404.eta page must never escalate its 404: the body
+      // read is one more post-dispatch failure the fallback promise
+      // has to cover (decision #20)
+      const res2 = await fetch(BASE + '/definitely-missing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: big,
+      })
+      assert.strictEqual(res2.status, 404,
+        'over-cap POST to a missing path must stay a 404')
+      await res2.text()
     })
 
     await check('concurrent requests keep their own parameters', async () => {

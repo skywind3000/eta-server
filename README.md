@@ -28,6 +28,7 @@ Options:
 | `-H, --host <addr>` | bind address (HTTP mode only) | 127.0.0.1 |
 | `-q, --quiet` | no access log (HTTP mode only) | off |
 | `--access-log <path>` | append access log to `<path>`, `-` = stdout (HTTP mode only) | stderr |
+| `--allowed-hosts <list>` | extra `Host` names to accept, comma separated; `all` turns the check off (HTTP mode only) | loopback names, `*.localhost`, literal IPs, bind address |
 | `-h, --help` | help | |
 
 With no positional argument it starts the HTTP server; with one, it renders that script once to stdout (CLI mode, below).
@@ -149,8 +150,10 @@ Only erasable syntax is allowed (type annotations / interface / type / generics 
 - `PATH_INFO`: requesting `hello.eta/foo/bar` renders `hello.eta` with `_SERVER.PATH_INFO = '/foo/bar'`.
 - Templates are re-read and re-compiled on every request — edit, refresh, done.
 - Errors in a script produce a 500 page with the escaped error and stack trace.
-- Request body cap: 64MB (413 beyond it). Path traversal, symlink/junction escapes and other filesystem tricks are all rejected with 404.
-- Sessions are signed cookies (HMAC-SHA256, key derived from a random per-user secret persisted in your home directory, mixed with the document root). `_SESSION = {}` clears the session. Data is tamper-proof but visible to the client — don't store secrets.
+- Request body cap: 64MB (413 beyond it). Path traversal, symlink/junction escapes and other filesystem tricks are all rejected with 404 — including win32 8.3 short-name aliases (`/NODE_M~1/…`), which resolve to their real long name before any rule runs.
+- **Host allowlist**: requests whose `Host` is not a loopback name, a `*.localhost` name, a literal IP or the bind address get a 403. This stops a remote page from reaching your dev server by pointing its own hostname at `127.0.0.1` (DNS rebinding). Serving a custom hostname on purpose? `--allowed-hosts myapp.test`, or `--allowed-hosts all` to switch the check off.
+- Responses carry `Cache-Control: no-store` unless the script sets the header itself, so the browser can't hand back a stale copy of a file you just edited.
+- Sessions are signed cookies (HMAC-SHA256, key derived from a random per-user secret persisted in your home directory, mixed with the document root). `_SESSION = {}` (or `null` / `false`) clears the session. Data is tamper-proof but visible to the client — don't store secrets.
 
 ## CLI render mode
 
@@ -172,19 +175,28 @@ Rules (aligned with PHP CLI conventions): any file extension works; `-` means st
 const { startServer, renderCli, VERSION } = require('eta-server')
 
 const server = await startServer('./www', 5000, '127.0.0.1')
+
+// same knobs as the CLI flags, per instance
+const s2 = await startServer('./www', 5001, '127.0.0.1',
+  { quiet: true, accessLog: '/tmp/eta.log', allowedHosts: 'myapp.test' })
 ```
 
 ## Security scope
 
 eta-server is a lightweight dev server for **local / trusted environments**. `.eta` templates execute arbitrary JavaScript, equivalent to running scripts on your machine. No hardening for public exposure is attempted — put a reverse proxy in front if you must.
 
+One caveat worth knowing: a loopback bind is *not* an access control, because the browser you use for other browsing can be aimed at `127.0.0.1` by any page you visit (DNS rebinding). The built-in Host allowlist is what closes that door; if you disable it with `--allowed-hosts all`, understand that any web page you open can then talk to this server and read its responses.
+
 ## Production deployment
 
 If you really need to expose eta-server, run it behind a reverse proxy: keep it bound to localhost (`-H 127.0.0.1`, the default) and let Apache/nginx handle TLS, static assets, logging and the public interface.
 
 ```bash
-npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 -q --access-log /var/log/eta-server.log
+npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 -q \
+  --access-log /var/log/eta-server.log --allowed-hosts example.com
 ```
+
+> **`--allowed-hosts` is required behind a proxy.** Both configurations below forward the client's `Host` unchanged (`ProxyPreserveHost On` / `proxy_set_header Host $host`), so your public domain arrives as the `Host` header and the allowlist rejects it with a 403 until you name it. List every hostname the site answers on, comma separated (`--allowed-hosts example.com,www.example.com`). Dropping the header forwarding instead also works — eta-server then sees `127.0.0.1` — but `_SERVER.SERVER_NAME` and `HTTP_HOST` lose the real domain.
 
 ### Apache (reverse proxy)
 
@@ -238,7 +250,7 @@ Whichever proxy you use, keep eta-server itself alive with a process supervisor.
 
 ```ini
 [program:eta-server]
-command=/usr/bin/npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1
+command=/usr/bin/npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 --allowed-hosts example.com
 directory=/srv/eta/www
 autostart=true
 autorestart=true

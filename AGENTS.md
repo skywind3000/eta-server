@@ -11,17 +11,17 @@ eta-server is a PHP-style dynamic page server for `.eta` templates: the file pat
 ## Authoritative documentation (read before changing behavior)
 
 - **[docs/prd.md](docs/prd.md)** — product requirements: positioning and security scope, template service semantics, Bridge API (`_GET`/`_POST`/`_SERVER`/`_SESSION`/`RESP`/`require` etc.), both CLI modes
-- **[docs/spec.md](docs/spec.md)** — technical spec and key decisions (#1–#14): renderStringAsync choice, self-implemented session, path hardening (realpath containment / Windows special cases), per-request state isolation, etc. **Behavior changes must update prd/spec in the same commit**
+- **[docs/spec.md](docs/spec.md)** — technical spec and key decisions (#1–#20): renderStringAsync choice, self-implemented session, path hardening (canonical realpath containment / Windows special cases / 8.3 aliasing), Host allowlist, per-request state isolation, etc. **Behavior changes must update prd/spec in the same commit**
 
 ## Directory layout
 
 ```
-eta-server.js      main program (single file, HTTP server + CLI render, ~950 lines)
+eta-server.js      main program (single file, HTTP server + CLI render, ~1700 lines)
 package.json       npm package definition (bin: eta-server; files include docs/prd.md docs/spec.md)
 docs/prd.md        product requirements
 docs/spec.md       technical spec and decision log
 demo/              demo site (doubles as test fixture — tests assert on demo content)
-tests/test_server.js   HTTP mode tests (spawned child process, port 5177, 61 checks; symlink probes self-SKIP without privilege)
+tests/test_server.js   HTTP mode tests (spawned child process, port 5177, 69 checks; symlink probes self-SKIP without privilege, 8.3 probes self-SKIP on volumes without short names)
 tests/test_cli.js      CLI render mode tests (spawnSync assertions)
 ```
 
@@ -41,11 +41,12 @@ The tests themselves need Node 18+ (fetch); `engines.node >= 22.18` is required 
 
 1. **Zero-dependency principle**: never add runtime dependencies (HTTP via `node:http`, sessions via `node:crypto`, CLI parsing hand-written) — see spec decision #8
 2. **PHP feel first**: Bridge API names and semantics follow PHP superglobals; templates access them bare via `useWith`; changes must not break existing template semantics
-3. **Fail-closed security semantics**: path traversal / symlink escapes / non-whitelisted extensions all return 404, indistinguishable from "does not exist" — see spec decisions #7/#12
-4. **Per-request isolation**: `ctx` holds only immutable startup config; request-scoped state is passed as parameters layer by layer; shared mutable state is forbidden — see spec decision #14
-5. **Buffered output model**: rendering is a pure function; the response is sent only after rendering returns; body priority is binary(writeraw) > text(json) > rendered text — see spec decision #6
-6. **Demo is the fixture**: `tests/` asserts on demo page content byte-for-byte; changing demo wording requires matching test updates
-7. **Version sync**: the `VERSION` constant at the top of `eta-server.js` must match `version` in `package.json`
+3. **Fail-closed security semantics**: path traversal / symlink escapes / non-whitelisted extensions all return 404, indistinguishable from "does not exist" — see spec decisions #7/#12. Every path rule lives in the single `gateReal()` chokepoint (decision #20); never re-implement one in a dispatcher branch, and use `realpathCanon()` (never bare `fs.realpathSync`) when resolving anything that will be compared against the root
+4. **Host allowlist**: HTTP mode answers only to loopback names / `*.localhost` / literal IPs / the bind address, else 403 — the DNS-rebinding defense (decision #20); `--allowed-hosts` extends it
+5. **Per-request isolation**: `ctx` holds only immutable startup config; request-scoped state is passed as parameters layer by layer; shared mutable state is forbidden — see spec decision #14
+6. **Buffered output model**: rendering is a pure function; the response is sent only after rendering returns; body priority is binary(writeraw) > text(json) > rendered text — see spec decision #6
+7. **Demo is the fixture**: `tests/` asserts on demo page content byte-for-byte; changing demo wording requires matching test updates
+8. **Version sync**: the `VERSION` constant at the top of `eta-server.js` must match `version` in `package.json`
 
 ## Publishing workflow
 
