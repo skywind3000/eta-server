@@ -29,6 +29,7 @@ Options:
 | `-q, --quiet` | no access log (HTTP mode only) | off |
 | `--access-log <path>` | append access log to `<path>`, `-` = stdout (HTTP mode only) | stderr |
 | `--allowed-hosts <list>` | extra `Host` names to accept, comma separated; `all` turns the check off (HTTP mode only) | loopback names, `*.localhost`, literal IPs, bind address |
+| `--behind-proxy` | behind a reverse proxy: skip the Host check, trust `X-Forwarded-For/-Proto/-Host` (HTTP mode only) | off |
 | `-h, --help` | help | |
 
 With no positional argument it starts the HTTP server; with one, it renders that script once to stdout (CLI mode, below).
@@ -106,7 +107,7 @@ All bridge names are available bare in templates (thanks to Eta `useWith`); the 
 | Name | Description |
 |---|---|
 | `_GET` / `_POST` / `_REQUEST` | query params / form-urlencoded body / merged (POST wins) |
-| `_SERVER` | request environment: `REQUEST_METHOD`, `QUERY_STRING`, `REQUEST_URI`, `SCRIPT_NAME`, `PATH_INFO`, `SCRIPT_FILENAME`, `SCRIPT_DIRNAME`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME`, `SERVER_PORT`, `REQUEST_SCHEME`, `SERVER_PROTOCOL`, `REQUEST_TIME` / `REQUEST_TIME_FLOAT`, `HTTP_*` headers, plus `argv` in CLI mode |
+| `_SERVER` | request environment: `REQUEST_METHOD`, `QUERY_STRING`, `REQUEST_URI`, `SCRIPT_NAME`, `PATH_INFO`, `SCRIPT_FILENAME`, `SCRIPT_DIRNAME`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME`, `SERVER_PORT`, `REQUEST_SCHEME` (the first, third and sixth follow `X-Forwarded-*` under `--behind-proxy`), `SERVER_PROTOCOL`, `REQUEST_TIME` / `REQUEST_TIME_FLOAT`, `HTTP_*` headers, plus `argv` in CLI mode |
 | `_COOKIE` | cookie dict (values percent-decoded) |
 | `_SESSION` | session object — signed-cookie based, no server-side storage, sliding 30-minute timeout. Mutate in place, or reassign the whole object (`_SESSION = {}`) to clear it |
 | `_BODY` | raw request body (Buffer, like `php://input`) |
@@ -151,7 +152,8 @@ Only erasable syntax is allowed (type annotations / interface / type / generics 
 - Templates are re-read and re-compiled on every request — edit, refresh, done.
 - Errors in a script produce a 500 page with the escaped error and stack trace.
 - Request body cap: 64MB (413 beyond it). Path traversal, symlink/junction escapes and other filesystem tricks are all rejected with 404 — including win32 8.3 short-name aliases (`/NODE_M~1/…`), which resolve to their real long name before any rule runs.
-- **Host allowlist**: requests whose `Host` is not a loopback name, a `*.localhost` name, a literal IP or the bind address get a 403. This stops a remote page from reaching your dev server by pointing its own hostname at `127.0.0.1` (DNS rebinding). Serving a custom hostname on purpose? `--allowed-hosts myapp.test`, or `--allowed-hosts all` to switch the check off.
+- **Host allowlist**: requests whose `Host` is not a loopback name, a `*.localhost` name, a literal IP or the bind address get a 403. This stops a remote page from reaching your dev server by pointing its own hostname at `127.0.0.1` (DNS rebinding). Serving a custom hostname on purpose? `--allowed-hosts myapp.test`, or `--allowed-hosts all` to switch the check off. Behind a reverse proxy use `--behind-proxy` instead — see [Production deployment](#production-deployment).
+- `X-Forwarded-For` / `-Proto` / `-Host` are **ignored** unless `--behind-proxy` says a proxy owns the port; a rebound page is same-origin and could otherwise forge its own client address.
 - Responses carry `Cache-Control: no-store` unless the script sets the header itself, so the browser can't hand back a stale copy of a file you just edited.
 - Sessions are signed cookies (HMAC-SHA256, key derived from a random per-user secret persisted in your home directory, mixed with the document root). `_SESSION = {}` (or `null` / `false`) clears the session. Data is tamper-proof but visible to the client — don't store secrets.
 
@@ -179,6 +181,10 @@ const server = await startServer('./www', 5000, '127.0.0.1')
 // same knobs as the CLI flags, per instance
 const s2 = await startServer('./www', 5001, '127.0.0.1',
   { quiet: true, accessLog: '/tmp/eta.log', allowedHosts: 'myapp.test' })
+
+// behind a proxy: trust X-Forwarded-* and skip the Host check
+const s3 = await startServer('./www', 5002, '127.0.0.1',
+  { behindProxy: true })
 ```
 
 ## Security scope
@@ -193,10 +199,12 @@ If you really need to expose eta-server, run it behind a reverse proxy: keep it 
 
 ```bash
 npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 -q \
-  --access-log /var/log/eta-server.log --allowed-hosts example.com
+  --access-log /var/log/eta-server.log --behind-proxy
 ```
 
-> **`--allowed-hosts` is required behind a proxy.** Both configurations below forward the client's `Host` unchanged (`ProxyPreserveHost On` / `proxy_set_header Host $host`), so your public domain arrives as the `Host` header and the allowlist rejects it with a 403 until you name it. List every hostname the site answers on, comma separated (`--allowed-hosts example.com,www.example.com`). Dropping the header forwarding instead also works — eta-server then sees `127.0.0.1` — but `_SERVER.SERVER_NAME` and `HTTP_HOST` lose the real domain.
+> **Use `--behind-proxy`.** Both configurations below forward the client's `Host` unchanged (`ProxyPreserveHost On` / `proxy_set_header Host $host`), so your public domain arrives as the `Host` header — and the rebinding allowlist would reject it with a 403, because from the server's side a forwarded request and a rebound one are indistinguishable. The flag is how you declare the topology, and it pays for itself: it also makes eta-server *read* the `X-Forwarded-*` headers these configs already send, so `_SERVER.REMOTE_ADDR` becomes the real client instead of `127.0.0.1`, `_SERVER.REQUEST_SCHEME` reports `https` when the client used TLS, and access-log lines carry the client address rather than the proxy's.
+>
+> Keep the bind address private (`-H 127.0.0.1`, the default) when using it — the flag's contract is that only your proxy can reach the port, since anything that can connect directly may now forge its own address and scheme. Want both belt and braces? `--behind-proxy --allowed-hosts example.com,www.example.com` keeps the Host allowlist enforced on top.
 
 ### Apache (reverse proxy)
 
@@ -250,7 +258,7 @@ Whichever proxy you use, keep eta-server itself alive with a process supervisor.
 
 ```ini
 [program:eta-server]
-command=/usr/bin/npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 --allowed-hosts example.com
+command=/usr/bin/npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 --behind-proxy
 directory=/srv/eta/www
 autostart=true
 autorestart=true

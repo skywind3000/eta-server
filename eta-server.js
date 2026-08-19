@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.4.0'
+const VERSION = '0.4.1'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -439,8 +439,14 @@ function clfEscape (value) {
   return String(value).replace(/[\\"]/g, (c) => '\\' + c)
 }
 
-function accessLine (req, res, state, start) {
-  const remote = (req.socket && req.socket.remoteAddress) || '-'
+function accessLine (req, res, state, start, ctx) {
+  // behind a trusted proxy every peer address is the proxy itself, so
+  // the log would read 127.0.0.1 for the whole world; the forwarded
+  // client is what makes the log useful (and is only trusted under
+  // --behind-proxy, like _SERVER.REMOTE_ADDR)
+  const remote = (ctx && ctx.behindProxy
+    ? forwardedClientIp(req.headers) : '') ||
+    (req.socket && req.socket.remoteAddress) || '-'
   const ms = Date.now() - start
   return remote + ' - - [' + formatCltTime(new Date(start)) + '] "' +
     clfEscape(req.method) + ' ' + clfEscape(req.url) +
@@ -501,6 +507,51 @@ function buildAllowedHosts (host, spec) {
   add(host)
   if (s) for (const item of s.split(',')) add(item)
   return out
+}
+
+/* ---------------------------------------------------------------------
+ * reverse proxy support (--behind-proxy, decision #20 amendment)
+ * ------------------------------------------------------------------- */
+
+// There is NO way to tell a proxied request from a DNS-rebound one by
+// inspection: both arrive on the loopback interface with an
+// attacker-influenceable Host, and after a rebind the attacker's page is
+// same-origin, so it can set X-Forwarded-* freely (no CORS preflight to
+// stop it). The operator has to declare the topology — which is exactly
+// why vite / webpack-dev-server make it configuration too. `--behind-
+// proxy` is that declaration, and it is worth a flag of its own because
+// it also fixes what the proxy setup silently lost: the documented
+// Apache / nginx configs forward X-Real-IP and X-Forwarded-Proto, and
+// nothing here used to read them, so every request looked like plain
+// http from 127.0.0.1 (in _SERVER and in every access-log line).
+//
+// Trusting these headers is safe ONLY because the flag asserts a proxy
+// owns the port. Without it they stay ignored, so a rebound page cannot
+// forge a client IP.
+
+// leftmost X-Forwarded-For entry is the original client (each hop
+// appends its peer); X-Real-IP is nginx's single-value equivalent
+function forwardedClientIp (headers) {
+  const xff = headers['x-forwarded-for']
+  if (xff) {
+    const first = String(xff).split(',')[0].trim()
+    if (first) return first
+  }
+  const real = headers['x-real-ip']
+  if (real) {
+    const one = String(real).trim()
+    if (one) return one
+  }
+  return ''
+}
+
+// only http / https are accepted: the value lands in _SERVER and
+// templates build URLs out of it
+function forwardedScheme (headers) {
+  const proto = headers['x-forwarded-proto']
+  if (!proto) return ''
+  const first = String(proto).split(',')[0].trim().toLowerCase()
+  return (first === 'http' || first === 'https') ? first : ''
 }
 
 function isHostAllowed (allowed, hostHeader) {
@@ -795,17 +846,30 @@ function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx,
     SCRIPT_FILENAME: scriptAbs,
     SCRIPT_DIRNAME: path.dirname(scriptAbs),
     DOCUMENT_ROOT: ctx.root,
-    REMOTE_ADDR: req.socket.remoteAddress || '',
+    // behind a trusted proxy the peer is the proxy, so the real client
+    // comes from X-Forwarded-For / X-Real-IP (mod_remoteip semantics:
+    // REMOTE_ADDR *becomes* the client, the raw peer stays visible in
+    // HTTP_X_FORWARDED_FOR). Ignored without --behind-proxy so a
+    // rebound page cannot forge an address
+    REMOTE_ADDR: (ctx.behindProxy ? forwardedClientIp(headers) : '') ||
+      req.socket.remoteAddress || '',
     CONTENT_TYPE: headers['content-type'] || '',
     CONTENT_LENGTH: headers['content-length'] || '',
     // CGI / PHP semantics: SERVER_NAME is the name the client asked
     // for, not the bind address (which reported a useless '0.0.0.0'
     // under -H 0.0.0.0). Safe to trust now that the Host header passes
     // the allowlist first (decision #20); the bind address remains the
-    // fallback for clients that send no Host at all
-    SERVER_NAME: hostnameOf(headers['host']) || ctx.host,
+    // fallback for clients that send no Host at all. X-Forwarded-Host
+    // wins when trusted — a proxy that does NOT preserve Host puts the
+    // public name only there
+    SERVER_NAME: (ctx.behindProxy
+      ? hostnameOf(headers['x-forwarded-host']) : '') ||
+      hostnameOf(headers['host']) || ctx.host,
     SERVER_PORT: String(ctx.port),
-    REQUEST_SCHEME: 'http',
+    // https terminates at the proxy, so the scheme the client actually
+    // used is only knowable from X-Forwarded-Proto
+    REQUEST_SCHEME: (ctx.behindProxy ? forwardedScheme(headers) : '') ||
+      'http',
     SERVER_PROTOCOL: 'HTTP/' + (req.httpVersion || '1.1'),
     REQUEST_TIME: Math.floor(now / 1000),
     REQUEST_TIME_FLOAT: now / 1000,
@@ -1500,8 +1564,14 @@ function startServer (rootDir, port, host, options) {
     }
   }
   // null = check disabled; immutable startup config like every other
-  // ctx member (decision #14)
-  const allowedHosts = buildAllowedHosts(host, options.allowedHosts)
+  // ctx member (decision #14). --behind-proxy asserts that a proxy owns
+  // this port, which is exactly the assertion the Host check would
+  // otherwise ask for — so it stands in for the allowlist. An explicit
+  // --allowed-hosts still wins: naming your domains is strictly
+  // stronger than trusting whatever the proxy forwards
+  const behindProxy = !!options.behindProxy
+  const allowedHosts = (behindProxy && !options.allowedHosts)
+    ? null : buildAllowedHosts(host, options.allowedHosts)
 
   const ctx = {
     root: root,
@@ -1515,12 +1585,22 @@ function startServer (rootDir, port, host, options) {
     eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
     accessLog: accessLog,
     allowedHosts: allowedHosts,
+    behindProxy: behindProxy,
   }
 
   if (allowedHosts === null) {
-    console.error('eta-server: warning: Host allowlist disabled ' +
-      '(--allowed-hosts all) — any web page the browser visits can now ' +
-      'reach this server through a rebound DNS name and read the responses')
+    if (behindProxy) {
+      // not the same risk as --allowed-hosts all: the flag's contract is
+      // "only the proxy can reach this port", so say what breaks it
+      console.error('eta-server: --behind-proxy: Host check off, ' +
+        'X-Forwarded-For / -Proto / -Host trusted. Keep the bind address ' +
+        'private (-H 127.0.0.1) — on a reachable interface any client can ' +
+        'now forge its address and scheme')
+    } else {
+      console.error('eta-server: warning: Host allowlist disabled ' +
+        '(--allowed-hosts all) — any web page the browser visits can now ' +
+        'reach this server through a rebound DNS name and read the responses')
+    }
   }
 
   // loopback binds are the intended usage; anything else deserves a
@@ -1540,7 +1620,7 @@ function startServer (rootDir, port, host, options) {
     // aborted connections (destroyed before completion) are not logged
     res.on('finish', () => {
       const stream = ctx.accessLog
-      if (stream) stream.write(accessLine(req, res, state, start) + '\n')
+      if (stream) stream.write(accessLine(req, res, state, start, ctx) + '\n')
     })
     handleRequest(req, res, ctx).catch((err) => {
       sendError(res, 500, 'Internal Server Error', String(err && err.stack || err))
@@ -1597,6 +1677,10 @@ function printHelp () {
   console.log('                      separated (default: loopback names,')
   console.log('                      *.localhost, literal IPs and the bind')
   console.log('                      address); "all" disables the check')
+  console.log('  --behind-proxy      running behind a reverse proxy: skip the')
+  console.log('                      Host check and take the client address /')
+  console.log('                      scheme / host from X-Forwarded-For,')
+  console.log('                      X-Forwarded-Proto, X-Forwarded-Host')
   console.log('  -h, --help          show this help')
   console.log('')
   console.log('CLI mode:')
@@ -1607,7 +1691,7 @@ function printHelp () {
 
 function parseArgs (argv) {
   const opts = { root: process.cwd(), port: 5000, host: '127.0.0.1',
-    quiet: false, accessLog: null, allowedHosts: null,
+    quiet: false, accessLog: null, allowedHosts: null, behindProxy: false,
     script: null, args: [] }
   const args = argv.slice(2)
   for (let i = 0; i < args.length; i++) {
@@ -1633,6 +1717,8 @@ function parseArgs (argv) {
     } else if (a === '--allowed-hosts') {
       if (i + 1 >= args.length) throw new Error('missing value for ' + a)
       opts.allowedHosts = args[++i]
+    } else if (a === '--behind-proxy') {
+      opts.behindProxy = true
     } else if (a === '-h' || a === '--help') {
       printHelp()
       process.exit(0)
@@ -1677,7 +1763,7 @@ if (require.main === module) {
     })
     startServer(opts.root, opts.port, opts.host, {
       quiet: opts.quiet, accessLog: opts.accessLog,
-      allowedHosts: opts.allowedHosts,
+      allowedHosts: opts.allowedHosts, behindProxy: opts.behindProxy,
     }).then((server) => {
       printBanner(path.resolve(opts.root), opts.port, opts.host)
       const shutdown = () => {

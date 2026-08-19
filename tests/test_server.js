@@ -57,11 +57,11 @@ function writeDemo (name, text) {
 // GET with a hand-written Host header: fetch() treats Host as a
 // forbidden header and silently keeps its own, so the rebinding probes
 // have to go through node:http
-function rawGet (port, hostHeader, urlPath) {
+function rawGet (port, hostHeader, urlPath, extra) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: '127.0.0.1', port: port, path: urlPath, method: 'GET',
-      headers: { Host: hostHeader },
+      headers: Object.assign({ Host: hostHeader }, extra || {}),
     }, (res) => {
       let body = ''
       res.on('data', (c) => { body += c.toString() })
@@ -739,6 +739,75 @@ async function main () {
           if (srvE.closeAllConnections) srvE.closeAllConnections()
           await new Promise(r => srvD.close(r))
           await new Promise(r => srvE.close(r))
+        }
+      })
+
+    await check('X-Forwarded-* are ignored without --behind-proxy',
+      async () => {
+        // a DNS-rebound page is same-origin, so it can set these headers
+        // freely (no CORS preflight stops it) — trusting them by default
+        // would hand every template a forgeable client address
+        writeDemo('t_fwd.eta', '<%~ _SERVER.REMOTE_ADDR %>|' +
+          '<%~ _SERVER.REQUEST_SCHEME %>|<%~ _SERVER.SERVER_NAME %>')
+        const r = await rawGet(PORT, 'localhost:' + PORT, '/t_fwd.eta', {
+          'X-Forwarded-For': '203.0.113.9',
+          'X-Forwarded-Proto': 'https',
+          'X-Forwarded-Host': 'spoofed.example',
+        })
+        assert.strictEqual(r.status, 200)
+        assert.strictEqual(r.body, '127.0.0.1|http|localhost')
+      })
+
+    await check('--behind-proxy trusts X-Forwarded-* and skips the Host check',
+      async () => {
+        const mod = require(SERVER)
+        const portP = PORT + 10
+        const logP = path.join(os.tmpdir(), 'eta-proxy-' + Date.now() + '.log')
+        const srvP = await mod.startServer(ROOT, portP, '127.0.0.1',
+          { accessLog: logP, behindProxy: true })
+        // the same flag with an explicit allowlist: naming domains is
+        // stronger than trusting the proxy, so the allowlist still wins
+        const portQ = PORT + 11
+        const srvQ = await mod.startServer(ROOT, portQ, '127.0.0.1',
+          { quiet: true, behindProxy: true, allowedHosts: 'example.com' })
+        try {
+          // the public domain the proxy forwards is accepted
+          const r1 = await rawGet(portP, 'example.com', '/t_fwd.eta', {
+            'X-Forwarded-For': '203.0.113.9, 10.0.0.1',
+            'X-Forwarded-Proto': 'https',
+          })
+          assert.strictEqual(r1.status, 200, 'proxied Host must pass')
+          // leftmost XFF entry is the client; scheme comes from the proxy;
+          // Host still names the site (no X-Forwarded-Host sent here)
+          assert.strictEqual(r1.body, '203.0.113.9|https|example.com')
+          // a proxy that does NOT preserve Host puts the name only in
+          // X-Forwarded-Host
+          const r2 = await rawGet(portP, '127.0.0.1:' + portP, '/t_fwd.eta', {
+            'X-Real-IP': '198.51.100.7',
+            'X-Forwarded-Host': 'www.example.com',
+          })
+          assert.strictEqual(r2.body, '198.51.100.7|http|www.example.com')
+          // a bogus scheme is not passed through to templates
+          const r3 = await rawGet(portP, 'example.com', '/t_fwd.eta',
+            { 'X-Forwarded-Proto': 'javascript' })
+          assert.strictEqual(r3.body.split('|')[1], 'http')
+          // the access log reports the forwarded client, not the proxy
+          await new Promise(r => setTimeout(r, 150))
+          const text = fs.readFileSync(logP, 'utf8')
+          assert.ok(/^203\.0\.113\.9 - - \[/m.test(text),
+            'access log must show the forwarded client address')
+          // explicit allowlist still enforced under --behind-proxy
+          assert.strictEqual(
+            (await rawGet(portQ, 'example.com', '/index.eta')).status, 200)
+          assert.strictEqual(
+            (await rawGet(portQ, 'evil.example', '/index.eta')).status, 403,
+            '--allowed-hosts must outrank --behind-proxy')
+        } finally {
+          if (srvP.closeAllConnections) srvP.closeAllConnections()
+          if (srvQ.closeAllConnections) srvQ.closeAllConnections()
+          await new Promise(r => srvP.close(r))
+          await new Promise(r => srvQ.close(r))
+          try { fs.rmSync(logP) } catch (e) { }
         }
       })
 
