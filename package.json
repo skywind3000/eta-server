@@ -4,7 +4,7 @@
   "description": "PHP-style dev server for .eta templates: file path is route, drop-in pages like .php",
   "main": "eta-server.js",
   "bin": {
-    "eta-server": "./eta-server.js"
+    "eta-server": "eta-server.js"
   },
   "files": [
     "eta-server.js",
