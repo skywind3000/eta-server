@@ -794,6 +794,8 @@ async function main () {
 
     await check('.404.eta fallback renders custom 404 pages', async () => {
       writeDemo('.404.eta',
+        '<% if (_GET.bad) RESP.status("abc") %>' +
+        '<% if (_GET.big) _SESSION.blob = "x".repeat(5000) %>' +
         'CUSTOM-404:<%~ _SERVER.REQUEST_URI %>' +
         ':qs=<%~ typeof _SERVER.QUERY_STRING %>')
       const res = await fetch(BASE + '/definitely-missing')
@@ -805,6 +807,17 @@ async function main () {
       const r0 = await fetch(BASE + '/NUL?a=1')
       assert.strictEqual(r0.status, 404)
       assert.ok((await r0.text()).indexOf(':qs=string') >= 0)
+      // post-render failures must ALSO degrade to the built-in 404:
+      // the "never to a non-404" promise covers invalid status codes
+      // and oversized sessions, not just render exceptions
+      const rb = await fetch(BASE + '/definitely-missing?bad=1')
+      assert.strictEqual(rb.status, 404)
+      const bodyB = await rb.text()
+      assert.ok(bodyB.indexOf('CUSTOM-404') < 0, 'must be the built-in page')
+      assert.ok(bodyB.indexOf('Not Found') >= 0)
+      const rg = await fetch(BASE + '/definitely-missing?big=1')
+      assert.strictEqual(rg.status, 404)
+      assert.ok((await rg.text()).indexOf('CUSTOM-404') < 0)
       // rejected paths keep the same status (fail-closed)
       const r2 = await fetch(BASE + '/tests/../eta-server.js')
       assert.strictEqual(r2.status, 404)

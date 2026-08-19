@@ -216,6 +216,8 @@ A fourth external review re-verified v0.3.0 point by point (all 14 previous fixe
 
 The review also re-verified every v0.3.0 fix empirically (duplicate CL/CT gone, `_SESSION = {}` clears with `Max-Age=0`, platform-independent self-protection, persisted session secret, per-instance access log, `*.eta` directories, bodyless 204/304, fd-based static, `_404`-style fallback, multipart warning, null-proto `_SERVER`, non-loopback warning) — no regressions.
 
+**Post-release amendment (fifth review, v0.3.2)**: the "broken fallback degrades to the built-in page — never to a non-404" promise had two more holes after rendering — an invalid `RESP.status()` (status validation) and an oversized session (>4KB cookie limit) both returned 500 from a `.404.eta` page (empirically reproduced). Both `sendError(500)` sites now honor `plain404OnError`: log one stderr line and emit the built-in 404, same as the render-exception path. Cosmetic consistency fix alongside: the `.well-known` exemption now folds case like the `node_modules` match next to it (direction stays fail-closed — ACME only uses lowercase).
+
 ## Bridge API list
 
 | Name | Type | Description |

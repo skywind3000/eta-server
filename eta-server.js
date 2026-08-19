@@ -26,7 +26,7 @@ const os = require('node:os')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.3.1'
+const VERSION = '0.3.2'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -473,7 +473,9 @@ function realInside (rootReal, abs) {
 // mysterious 404 is diagnosable at a glance. The .404.eta fallback
 // page is unroutable by the same dot rule.
 function isPrivateSegment (seg) {
-  if (seg === '.well-known') return false
+  // the exemption folds case like the node_modules match beside it
+  // (fail-closed either way — ACME only uses lowercase)
+  if (seg.toLowerCase() === '.well-known') return false
   return seg.toLowerCase() === 'node_modules' || seg.charAt(0) === '.'
 }
 
@@ -737,6 +739,13 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   // no meaningful interim response, and Node used to emit a fake
   // Content-Length on a body it then dropped ----
   if (!Number.isInteger(resp.code) || resp.code < 200 || resp.code > 999) {
+    if (opts.plain404OnError) {
+      // the spec promise holds past rendering too: a fallback page
+      // must never turn a 404 into a non-404 (decision #18)
+      console.error('eta-server: fallback page set an invalid status ' +
+        '(' + resp.code + '), degrading to the built-in 404')
+      return sendError(res, 404, 'Not Found')
+    }
     return sendError(res, 500, 'Internal Server Error',
       'invalid status code: ' + resp.code)
   }
@@ -810,6 +819,12 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     const sessCookie = SESSION_COOKIE + '=' +
       encodeSession(sessionOut, ctx.secret) + '; Path=/; HttpOnly; SameSite=Lax'
     if (Buffer.byteLength(sessCookie, 'utf8') > SESSION_COOKIE_LIMIT) {
+      if (opts.plain404OnError) {
+        // same fallback promise: degrade, never escalate (decision #18)
+        console.error('eta-server: fallback page session exceeded the ' +
+          'cookie capacity limit, degrading to the built-in 404')
+        return sendError(res, 404, 'Not Found')
+      }
       // browsers silently drop oversized cookies; fail loudly instead
       return sendError(res, 500, 'Internal Server Error',
         'session data exceeds the cookie capacity limit (about 4KB)')
