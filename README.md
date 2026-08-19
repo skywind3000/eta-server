@@ -176,6 +176,83 @@ const server = await startServer('./www', 5000, '127.0.0.1')
 
 eta-server is a lightweight dev server for **local / trusted environments**. `.eta` templates execute arbitrary JavaScript, equivalent to running scripts on your machine. No hardening for public exposure is attempted — put a reverse proxy in front if you must.
 
+## Production deployment
+
+If you really need to expose eta-server, run it behind a reverse proxy: keep it bound to localhost (`-H 127.0.0.1`, the default) and let Apache/nginx handle TLS, static assets, logging and the public interface.
+
+```bash
+npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 -q --access-log /var/log/eta-server.log
+```
+
+### Apache (reverse proxy)
+
+Enable the required modules first:
+
+```bash
+sudo a2enmod proxy proxy_http headers
+sudo systemctl restart apache2
+```
+
+Then add the proxy rules, e.g. in your vhost or a conf snippet under `conf-available/`:
+
+```apache
+# eta-server
+ProxyPreserveHost On
+ProxyPass /eta http://127.0.0.1:5000
+ProxyPassReverse /eta http://127.0.0.1:5000
+
+# forward the real client address / protocol to the app
+RequestHeader set X-Forwarded-Proto "https" env=HTTPS
+```
+
+Everything under `/eta/...` is forwarded to eta-server (the prefix is stripped, so `/eta/hello.eta` arrives as `/hello.eta`). To serve the app at the site root instead, use `ProxyPass / http://127.0.0.1:5000/` — but then it shadows Apache's own document root for that vhost.
+
+### nginx (reverse proxy)
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+
+    location /eta/ {
+        proxy_pass http://127.0.0.1:5000/;   # trailing slash strips the /eta prefix
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # serve everything else (including the whole site root) with:
+    # location / { proxy_pass http://127.0.0.1:5000/; ... }
+}
+```
+
+Note the trailing slash on `proxy_pass` — it strips the `/eta` prefix, matching the Apache behavior above; drop it if you want the prefix preserved (eta-server will then 404 those requests).
+
+### Keep-alive process
+
+Whichever proxy you use, keep eta-server itself alive with a process supervisor. Minimal Supervisor config (`/etc/supervisor/conf.d/eta-server.conf`):
+
+```ini
+[program:eta-server]
+command=/usr/bin/npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1
+directory=/srv/eta/www
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/eta-server.err.log
+stdout_logfile=/var/log/eta-server.out.log
+user=www-data
+```
+
+```bash
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl start eta-server
+```
+
+Reminders before going public: sessions are signed cookies (visible to the client — store no secrets), templates execute arbitrary JavaScript, and there is no rate limiting or request hardening beyond path containment. The proxy is your security boundary.
+
 ## Requirements
 
 Node.js ≥ 22.18 (the tests themselves only need Node 18+ for `fetch`; the 22.18 floor is for the in-template `require(.ts)` type-stripping feature).
