@@ -21,7 +21,7 @@ package.json       npm package definition (bin: eta-server; files include docs/p
 docs/prd.md        product requirements
 docs/spec.md       technical spec and decision log
 demo/              demo site (doubles as test fixture — tests assert on demo content)
-tests/test_server.js   HTTP mode tests (spawned child process, port 5177, 41 assertions)
+tests/test_server.js   HTTP mode tests (spawned child process, port 5177, 59 checks; symlink probes self-SKIP without privilege)
 tests/test_cli.js      CLI render mode tests (spawnSync assertions)
 ```
 

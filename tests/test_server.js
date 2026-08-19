@@ -26,7 +26,22 @@ const SERVER = path.join(__dirname, '..', 'eta-server.js')
 
 let passed = 0
 let failed = 0
+let skipped = 0
 const tmpDemoFiles = []
+
+// file-symlink capability probe: win32 needs elevation or developer
+// mode; tests requiring it SKIP (not fail) when unavailable. Junctions
+// need no privilege and stay unconditional
+const SYMLINK_OK = (() => {
+  const p = path.join(os.tmpdir(), 'eta-symlink-probe-' + process.pid)
+  try {
+    fs.symlinkSync(__filename, p, 'file')
+    fs.rmSync(p)
+    return true
+  } catch (e) {
+    return false
+  }
+})()
 
 // write a throwaway file inside the docroot, cleaned up at the end
 function writeDemo (name, text) {
@@ -47,6 +62,11 @@ async function check (name, fn) {
     console.log('  FAIL  ' + name)
     console.log('        ' + String(err && err.message || err))
   }
+}
+
+function skip (name, reason) {
+  skipped++
+  console.log('  SKIP  ' + name + ' (' + reason + ')')
 }
 
 async function waitForReady (tries) {
@@ -156,15 +176,36 @@ async function main () {
       await res.text()
     })
 
-    await check('legal "..b" filenames are not mistaken for escapes',
+    await check('dot-prefixed segments are hidden (404)', async () => {
+      // path.relative(root, root/'..b.eta') = '..b.eta': the
+      // first-segment containment check accepts such relative results,
+      // but the hidden-path convention (decision #17) denies any
+      // dot-prefixed segment before routing — 404 like any missing file
+      writeDemo('..b.eta', 'DOUBLE-DOT-NAME')
+      const res = await fetch(BASE + '/..b.eta')
+      assert.strictEqual(res.status, 404)
+      await res.text()
+    })
+
+    await check('hidden paths: _ prefix, dotfiles, node_modules are 404',
       async () => {
-        // path.relative(root, root/'..b.eta') = '..b.eta': a '..'
-        // prefix check would 404 this legal name (fail-closed but
-        // broken); the first-segment check must serve it
-        writeDemo('..b.eta', 'DOUBLE-DOT-NAME')
-        const res = await fetch(BASE + '/..b.eta')
-        assert.strictEqual(res.status, 200)
-        assert.ok((await res.text()).indexOf('DOUBLE-DOT-NAME') >= 0)
+        writeDemo('t_public.js', 'var x = 1')
+        writeDemo('_secret.js', 'module.exports = { DB_PASSWORD: "x" }')
+        writeDemo('_lib/config.json', '{"apiKey":"sk-live-secret-key"}')
+        writeDemo('.hidden.txt', 'HIDDEN')
+        const nm = path.join(ROOT, 'node_modules', 'pkg-data.json')
+        fs.mkdirSync(path.dirname(nm), { recursive: true })
+        fs.writeFileSync(nm, '{}')
+        tmpDemoFiles.push(path.join(ROOT, 'node_modules'))
+        const ok = await fetch(BASE + '/t_public.js')
+        assert.strictEqual(ok.status, 200, 'plain lib.js stays public')
+        await ok.text()
+        for (const u of ['/_secret.js', '/_lib/config.json',
+          '/.hidden.txt', '/node_modules/pkg-data.json']) {
+          const res = await fetch(BASE + u)
+          assert.strictEqual(res.status, 404, u)
+          await res.text()
+        }
       })
 
     await check('server source 404 incl. case variants (root=package dir)',
@@ -199,22 +240,27 @@ async function main () {
           // the root symlinking to the self file — the containment
           // check cannot catch it (target is inside the root), only
           // isSelfPath can; both index.eta and index.html branches
-          const idxDir = path.join(pkgRoot, '_t_selfidx')
-          fs.mkdirSync(idxDir)
-          try {
-            fs.symlinkSync(path.join(pkgRoot, 'eta-server.js'),
-              path.join(idxDir, 'index.html'))
-            const r1 = await fetch(BASE2 + '/_t_selfidx/')
-            await r1.text()
-            assert.strictEqual(r1.status, 404, 'index.html -> self symlink')
-            fs.rmSync(path.join(idxDir, 'index.html'))
-            fs.symlinkSync(path.join(pkgRoot, 'eta-server.js'),
-              path.join(idxDir, 'index.eta'))
-            const r2 = await fetch(BASE2 + '/_t_selfidx/')
-            await r2.text()
-            assert.strictEqual(r2.status, 404, 'index.eta -> self symlink')
-          } finally {
-            fs.rmSync(idxDir, { recursive: true, force: true })
+          if (SYMLINK_OK) {
+            const idxDir = path.join(pkgRoot, 't_selfidx')
+            fs.mkdirSync(idxDir)
+            try {
+              fs.symlinkSync(path.join(pkgRoot, 'eta-server.js'),
+                path.join(idxDir, 'index.html'))
+              const r1 = await fetch(BASE2 + '/t_selfidx/')
+              await r1.text()
+              assert.strictEqual(r1.status, 404, 'index.html -> self symlink')
+              fs.rmSync(path.join(idxDir, 'index.html'))
+              fs.symlinkSync(path.join(pkgRoot, 'eta-server.js'),
+                path.join(idxDir, 'index.eta'))
+              const r2 = await fetch(BASE2 + '/t_selfidx/')
+              await r2.text()
+              assert.strictEqual(r2.status, 404, 'index.eta -> self symlink')
+            } finally {
+              fs.rmSync(idxDir, { recursive: true, force: true })
+            }
+          } else {
+            skip('self-index symlink probes',
+              'file symlinks need elevation / developer mode')
           }
         } finally {
           child2.kill()
@@ -230,6 +276,27 @@ async function main () {
       // segments line uses <%~ %> raw output, so JSON is unescaped
       assert.ok(body.indexOf('["linwei","42"]') >= 0)
     })
+
+    await check('PATH_INFO may contain hidden-looking segments', async () => {
+      // the hidden-path convention checks the FILE part only; the
+      // PATH_INFO tail is data, not a file path
+      const res = await fetch(BASE + '/hello.eta/_user/42')
+      assert.strictEqual(res.status, 200)
+      const body = await res.text()
+      assert.ok(body.indexOf('PATH_INFO   : /_user/42') >= 0)
+    })
+
+    await check('directory named *.eta falls back to normal serving',
+      async () => {
+        writeDemo('assets.eta/site.css', 'body { color: red }')
+        const r1 = await fetch(BASE + '/assets.eta/site.css')
+        assert.strictEqual(r1.status, 200)
+        assert.ok((await r1.text()).indexOf('color: red') >= 0)
+        const r2 = await fetch(BASE + '/assets.eta', { redirect: 'manual' })
+        assert.strictEqual(r2.status, 301)
+        assert.strictEqual(r2.headers.get('location'), '/assets.eta/')
+        await r2.text()
+      })
 
     await check('JSON API echoes GET', async () => {
       const res = await fetch(BASE + '/api.eta?a=1&b=two')
@@ -259,6 +326,22 @@ async function main () {
       const data = await res.json()
       assert.deepStrictEqual(data.json, { hello: 'eta' })
     })
+
+    await check('multipart POST warns on stderr, _POST stays empty',
+      async () => {
+        const res = await fetch(BASE + '/api.eta', {
+          method: 'POST',
+          headers: { 'Content-Type': 'multipart/form-data; boundary=X' },
+          body: '--X\r\nContent-Disposition: form-data; name="a"\r\n\r\n' +
+            '1\r\n--X--\r\n',
+        })
+        assert.strictEqual(res.status, 200)
+        const data = await res.json()
+        assert.deepStrictEqual(data.post, {})
+        await new Promise(r => setTimeout(r, 100))
+        assert.ok(stderr.indexOf('multipart') >= 0,
+          'stderr missing the multipart warning')
+      })
 
     await check('session cookie persists across requests', async () => {
       const r1 = await fetch(BASE + '/index.eta')
@@ -294,6 +377,37 @@ async function main () {
       assert.ok(body2.indexOf('Visits in this session: <b>1</b>') >= 0)
     })
 
+    await check('_SESSION reassignment (_SESSION = {}) clears the session',
+      async () => {
+        writeDemo('t_sesscount.eta',
+          '<% _SESSION.n = (_SESSION.n || 0) + 1 %><%~ _SESSION.n %>')
+        writeDemo('t_sessclear.eta',
+          '<%~ JSON.stringify(_SESSION) %><% _SESSION = {} %>')
+        const r1 = await fetch(BASE + '/t_sesscount.eta')
+        assert.strictEqual(await r1.text(), '1')
+        const c1 = getSessionCookie(r1)
+        assert.ok(c1)
+        const r2 = await fetch(BASE + '/t_sesscount.eta',
+          { headers: { Cookie: c1 } })
+        assert.strictEqual(await r2.text(), '2')
+        const c2 = getSessionCookie(r2)
+        const r3 = await fetch(BASE + '/t_sessclear.eta',
+          { headers: { Cookie: c2 } })
+        const body3 = await r3.text()
+        assert.ok(body3.indexOf('"n":2') >= 0)
+        const all = r3.headers.getSetCookie ? r3.headers.getSetCookie() : []
+        const cleared = all.filter((c) => c.startsWith('etasess=') &&
+          c.indexOf('Max-Age=0') >= 0)
+        assert.strictEqual(cleared.length, 1,
+          'cleared session must emit one Max-Age=0 cookie')
+        // the browser now holds the cleared cookie; counting restarts
+        const c3 = getSessionCookie(r3)
+        assert.strictEqual(c3, 'etasess=')
+        const r4 = await fetch(BASE + '/t_sesscount.eta',
+          { headers: { Cookie: c3 } })
+        assert.strictEqual(await r4.text(), '1')
+      })
+
     await check('require() demo works (node:path)', async () => {
       const res = await fetch(BASE + '/require.eta')
       assert.strictEqual(res.status, 200)
@@ -306,15 +420,15 @@ async function main () {
       // Node's module cache is shared across createRequire instances;
       // the mtime-based invalidation must make library edits visible
       // without a server restart
-      const lib = writeDemo('_t_hotlib.js', 'module.exports = "v1"\n')
-      writeDemo('_t_hot.eta', '<%~ require("./_t_hotlib.js") %>')
-      const r1 = await fetch(BASE + '/_t_hot.eta')
+      const lib = writeDemo('t_hotlib.js', 'module.exports = "v1"\n')
+      writeDemo('t_hot.eta', '<%~ require("./t_hotlib.js") %>')
+      const r1 = await fetch(BASE + '/t_hot.eta')
       assert.strictEqual(await r1.text(), 'v1')
       fs.writeFileSync(lib, 'module.exports = "v2"\n')
       // guarantee a strictly newer mtime regardless of fs granularity
       const t = new Date(Date.now() + 1000)
       fs.utimesSync(lib, t, t)
-      const r2 = await fetch(BASE + '/_t_hot.eta')
+      const r2 = await fetch(BASE + '/t_hot.eta')
       assert.strictEqual(await r2.text(), 'v2')
     })
 
@@ -363,15 +477,15 @@ async function main () {
       const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eta-out-'))
       fs.writeFileSync(path.join(outDir, 'evil.eta'), 'EVIL')
       fs.writeFileSync(path.join(outDir, 'data.json'), '{"evil":1}')
-      const junc = path.join(ROOT, '_t_junc')
+      const junc = path.join(ROOT, 't_junc')
       tmpDemoFiles.push(junc)
       const type = process.platform === 'win32' ? 'junction' : 'dir'
       fs.symlinkSync(outDir, junc, type)
       try {
-        const r1 = await fetch(BASE + '/_t_junc/evil.eta')
+        const r1 = await fetch(BASE + '/t_junc/evil.eta')
         await r1.text()
         assert.strictEqual(r1.status, 404, 'escaping .eta template')
-        const r2 = await fetch(BASE + '/_t_junc/data.json')
+        const r2 = await fetch(BASE + '/t_junc/data.json')
         await r2.text()
         assert.strictEqual(r2.status, 404, 'escaping static file')
       } finally {
@@ -380,10 +494,15 @@ async function main () {
     })
 
     await check('symlink staying inside the root still serves', async () => {
-      const link = path.join(ROOT, '_t_in.txt')
+      if (!SYMLINK_OK) {
+        skip('symlink staying inside the root still serves',
+          'file symlinks need elevation / developer mode')
+        return
+      }
+      const link = path.join(ROOT, 't_in.txt')
       tmpDemoFiles.push(link)
       fs.symlinkSync(path.join(ROOT, 'style.css'), link)
-      const res = await fetch(BASE + '/_t_in.txt')
+      const res = await fetch(BASE + '/t_in.txt')
       assert.strictEqual(res.status, 200)
       await res.text()
     })
@@ -430,10 +549,10 @@ async function main () {
     // ==================== bridge / _SERVER parity ====================
 
     await check('HTTP _SERVER has SERVER_PROTOCOL and REQUEST_TIME', async () => {
-      writeDemo('_t_srvinfo.eta',
+      writeDemo('t_srvinfo.eta',
         '<%~ _SERVER.SERVER_PROTOCOL %>;<%~ _SERVER.REQUEST_TIME %>;' +
         '<%~ _SERVER.REQUEST_TIME_FLOAT %>')
-      const res = await fetch(BASE + '/_t_srvinfo.eta')
+      const res = await fetch(BASE + '/t_srvinfo.eta')
       assert.strictEqual(res.status, 200)
       const parts = (await res.text()).split(';')
       assert.strictEqual(parts[0], 'HTTP/1.1')
@@ -455,15 +574,15 @@ async function main () {
     // ==================== static whitelist expansion ====================
 
     await check('expanded static types served with right Content-Type', async () => {
-      writeDemo('_t.csv', 'a,b\n1,2')
-      writeDemo('_t.md', '# hello')
-      writeDemo('_t.js', 'var x = 1')
-      writeDemo('_t.webm', 'bytes')
+      writeDemo('t.csv', 'a,b\n1,2')
+      writeDemo('t.md', '# hello')
+      writeDemo('t.js', 'var x = 1')
+      writeDemo('t.webm', 'bytes')
       const expect = [
-        ['_t.csv', 'text/csv; charset=utf-8'],
-        ['_t.md', 'text/markdown; charset=utf-8'],
-        ['_t.js', 'text/javascript; charset=utf-8'],
-        ['_t.webm', 'video/webm'],
+        ['t.csv', 'text/csv; charset=utf-8'],
+        ['t.md', 'text/markdown; charset=utf-8'],
+        ['t.js', 'text/javascript; charset=utf-8'],
+        ['t.webm', 'video/webm'],
       ]
       for (const item of expect) {
         const res = await fetch(BASE + '/' + item[0])
@@ -476,9 +595,9 @@ async function main () {
     // ==================== session hardening ====================
 
     await check('session over 4KB gives 500', async () => {
-      writeDemo('_t_bigsess.eta',
+      writeDemo('t_bigsess.eta',
         '<% _SESSION.blob = "x".repeat(5000) %>ok')
-      const res = await fetch(BASE + '/_t_bigsess.eta')
+      const res = await fetch(BASE + '/t_bigsess.eta')
       assert.strictEqual(res.status, 500)
       const body = await res.text()
       assert.ok(body.indexOf('4KB') >= 0)
@@ -495,9 +614,9 @@ async function main () {
     })
 
     await check('session cookie name monopoly (setcookie dropped)', async () => {
-      writeDemo('_t_sessmono.eta',
+      writeDemo('t_sessmono.eta',
         '<% _SESSION.k = 1 %><% RESP.setcookie("etasess", "evil") %>ok')
-      const res = await fetch(BASE + '/_t_sessmono.eta')
+      const res = await fetch(BASE + '/t_sessmono.eta')
       assert.strictEqual(res.status, 200)
       await res.text()
       const all = res.headers.getSetCookie
@@ -509,9 +628,9 @@ async function main () {
 
     await check('setcookie with non-numeric maxage omits Max-Age',
       async () => {
-        writeDemo('_t_maxage.eta',
+        writeDemo('t_maxage.eta',
           '<% RESP.setcookie("c", "v", {maxage: "abc"}) %>ok')
-        const res = await fetch(BASE + '/_t_maxage.eta')
+        const res = await fetch(BASE + '/t_maxage.eta')
         assert.strictEqual(res.status, 200)
         await res.text()
         const all = res.headers.getSetCookie
@@ -523,11 +642,11 @@ async function main () {
 
     await check('hop-by-hop headers from templates are dropped',
       async () => {
-        writeDemo('_t_hop.eta',
+        writeDemo('t_hop.eta',
           '<% RESP.header("Transfer-Encoding", "chunked") %>' +
           '<% RESP.header("Connection", "close") %>' +
           '<% RESP.header("X-Ok", "1") %>ok')
-        const res = await fetch(BASE + '/_t_hop.eta')
+        const res = await fetch(BASE + '/t_hop.eta')
         assert.strictEqual(res.status, 200)
         await res.text()
         assert.strictEqual(res.headers.get('transfer-encoding'), null)
@@ -537,30 +656,72 @@ async function main () {
         assert.strictEqual(res.headers.get('x-ok'), '1')
       })
 
+    await check('header names normalized: lowercase CT overrides, ' +
+      'template CL dropped', async () => {
+        // a case-sensitive assembly used to ship TWO Content-Length
+        // lines here and undici rejected the whole response
+        writeDemo('t_hdrnorm.eta',
+          '<% RESP.header("content-type", "text/plain; charset=utf-8") %>' +
+          '<% RESP.header("content-length", "999") %>' +
+          '<% RESP.header("X-Dup", "a") %><% RESP.header("x-dup", "b") %>OK')
+        const res = await fetch(BASE + '/t_hdrnorm.eta')
+        assert.strictEqual(res.status, 200)
+        const body = await res.text()
+        assert.strictEqual(body, 'OK')
+        assert.strictEqual(res.headers.get('content-type'),
+          'text/plain; charset=utf-8')
+        assert.strictEqual(res.headers.get('content-length'),
+          String(Buffer.byteLength('OK')))
+        assert.strictEqual(res.headers.get('x-dup'), 'b',
+          'same name in different case must overwrite, not duplicate')
+      })
+
+    await check('list-based headers keep every value (Link)', async () => {
+      writeDemo('t_multilink.eta',
+        '<% RESP.header("Link", "<https://a.example>; rel=preconnect") %>' +
+        '<% RESP.header("link", "<https://b.example>; rel=dns-prefetch") %>ok')
+      const res = await fetch(BASE + '/t_multilink.eta')
+      assert.strictEqual(res.status, 200)
+      await res.text()
+      const link = String(res.headers.get('link'))
+      assert.ok(link.indexOf('<https://a.example>') >= 0)
+      assert.ok(link.indexOf('<https://b.example>') >= 0)
+    })
+
+    await check('204 status strips body, Content-Length and Content-Type',
+      async () => {
+        writeDemo('t_204.eta', '<% RESP.status(204) %>leftover')
+        const res = await fetch(BASE + '/t_204.eta')
+        assert.strictEqual(res.status, 204)
+        assert.strictEqual(res.headers.get('content-type'), null)
+        assert.strictEqual(res.headers.get('content-length'), null)
+        assert.strictEqual(await res.text(), '')
+      })
+
     // ==================== RESP small parity items ====================
 
     await check('RESP.status(9999) gives 500', async () => {
-      writeDemo('_t_status.eta', '<% RESP.status(9999) %>x')
-      const res = await fetch(BASE + '/_t_status.eta')
+      writeDemo('t_status.eta', '<% RESP.status(9999) %>x')
+      const res = await fetch(BASE + '/t_status.eta')
       assert.strictEqual(res.status, 500)
       const body = await res.text()
       assert.ok(body.indexOf('invalid status') >= 0)
     })
 
     await check('RESP.escape works like escape()', async () => {
-      writeDemo('_t_respescape.eta', '<%~ RESP.escape("<a>&") %>')
-      const res = await fetch(BASE + '/_t_respescape.eta')
+      writeDemo('t_respescape.eta', '<%~ RESP.escape("<a>&") %>')
+      const res = await fetch(BASE + '/t_respescape.eta')
       assert.strictEqual(res.status, 200)
       assert.strictEqual(await res.text(), '&lt;a&gt;&amp;')
     })
 
     await check('RESP.status(0)/status("abc") give 500', async () => {
-      writeDemo('_t_status0.eta', '<% RESP.status(0) %>x')
-      writeDemo('_t_statusabc.eta', '<% RESP.status("abc") %>x')
-      const r1 = await fetch(BASE + '/_t_status0.eta')
+      writeDemo('t_status0.eta', '<% RESP.status(0) %>x')
+      writeDemo('t_statusabc.eta', '<% RESP.status("abc") %>x')
+      const r1 = await fetch(BASE + '/t_status0.eta')
       assert.strictEqual(r1.status, 500)
       await r1.text()
-      const r2 = await fetch(BASE + '/_t_statusabc.eta')
+      const r2 = await fetch(BASE + '/t_statusabc.eta')
       assert.strictEqual(r2.status, 500)
       const body = await r2.text()
       assert.ok(body.indexOf('invalid status') >= 0)
@@ -577,6 +738,11 @@ async function main () {
     })
 
     await check('escaping index.eta/index.html fallbacks give 404', async () => {
+      if (!SYMLINK_OK) {
+        skip('escaping index.eta/index.html fallbacks give 404',
+          'file symlinks need elevation / developer mode')
+        return
+      }
       const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eta-out2-'))
       fs.writeFileSync(path.join(outDir, 'evil.eta'), 'EVIL <%= 1 %>')
       fs.writeFileSync(path.join(outDir, 'secret.html'), 'SECRET')
@@ -586,24 +752,40 @@ async function main () {
         fs.symlinkSync(target, path.join(ROOT, dir, link))
       }
       try {
-        mk('_t_esc1', 'index.eta', path.join(outDir, 'evil.eta'))
-        const r1 = await fetch(BASE + '/_t_esc1/')
+        mk('t_esc1', 'index.eta', path.join(outDir, 'evil.eta'))
+        const r1 = await fetch(BASE + '/t_esc1/')
         await r1.text()
         assert.strictEqual(r1.status, 404, 'escaping index.eta')
         // fail-closed: an escaping index candidate is a 404 even when
         // a legit fallback file exists next to it (fail-closed)
-        mk('_t_esc2', 'index.eta', path.join(outDir, 'evil.eta'))
-        fs.writeFileSync(path.join(ROOT, '_t_esc2', 'index.html'), 'OK')
-        const r2 = await fetch(BASE + '/_t_esc2/')
+        mk('t_esc2', 'index.eta', path.join(outDir, 'evil.eta'))
+        fs.writeFileSync(path.join(ROOT, 't_esc2', 'index.html'), 'OK')
+        const r2 = await fetch(BASE + '/t_esc2/')
         await r2.text()
         assert.strictEqual(r2.status, 404, 'escaping index.eta blocks dir')
-        mk('_t_esc3', 'index.html', path.join(outDir, 'secret.html'))
-        const r3 = await fetch(BASE + '/_t_esc3/')
+        mk('t_esc3', 'index.html', path.join(outDir, 'secret.html'))
+        const r3 = await fetch(BASE + '/t_esc3/')
         await r3.text()
         assert.strictEqual(r3.status, 404, 'escaping index.html')
       } finally {
         fs.rmSync(outDir, { recursive: true, force: true })
       }
+    })
+
+    await check('_404.eta fallback renders custom 404 pages', async () => {
+      writeDemo('_404.eta', 'CUSTOM-404:<%~ _SERVER.REQUEST_URI %>')
+      const res = await fetch(BASE + '/definitely-missing')
+      assert.strictEqual(res.status, 404)
+      const body = await res.text()
+      assert.ok(body.indexOf('CUSTOM-404:/definitely-missing') >= 0)
+      // rejected paths keep the same status (fail-closed)
+      const r2 = await fetch(BASE + '/tests/../eta-server.js')
+      assert.strictEqual(r2.status, 404)
+      await r2.text()
+      // the fallback file itself is hidden: no recursion, still 404
+      const r3 = await fetch(BASE + '/_404.eta')
+      assert.strictEqual(r3.status, 404)
+      await r3.text()
     })
 
     await check('oversized body receives a real 413 response', async () => {
@@ -704,6 +886,33 @@ async function main () {
         child4.kill()
       }
     })
+
+    await check('access log destination is per server instance', async () => {
+      // regression: the destination used to be a module-level global,
+      // so a second startServer({quiet:true}) silenced the first
+      const mod = require(SERVER)
+      const portA = PORT + 4
+      const portB = PORT + 5
+      const logA = path.join(os.tmpdir(), 'eta-iso-' + Date.now() + '.log')
+      const srvA = await mod.startServer(ROOT, portA, '127.0.0.1',
+        { accessLog: logA })
+      const srvB = await mod.startServer(ROOT, portB, '127.0.0.1',
+        { quiet: true })
+      try {
+        await (await fetch('http://127.0.0.1:' + portA +
+          '/hello.eta')).text()
+        await new Promise(r => setTimeout(r, 150))
+        const text = fs.readFileSync(logA, 'utf8')
+        assert.ok(/"GET \/hello\.eta HTTP\/1\.1" 200 \d+ \d+ms/.test(text),
+          'instance A lost its access log after instance B started')
+      } finally {
+        if (srvA.closeAllConnections) srvA.closeAllConnections()
+        if (srvB.closeAllConnections) srvB.closeAllConnections()
+        await new Promise(r => srvA.close(r))
+        await new Promise(r => srvB.close(r))
+        try { fs.rmSync(logA) } catch (e) { }
+      }
+    })
   } finally {
     for (const f of tmpDemoFiles) {
       try { fs.rmSync(f, { recursive: true, force: true }) } catch (e) { }
@@ -712,7 +921,8 @@ async function main () {
   }
 
   console.log('')
-  console.log('passed: ' + passed + ', failed: ' + failed)
+  console.log('passed: ' + passed + ', failed: ' + failed +
+    ', skipped: ' + skipped)
   process.exit(failed > 0 ? 1 : 0)
 }
 

@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/20 01:00:00
+ * Last Modified: 2026/08/19 22:00:00
  *
  * ===================================================================== */
 'use strict'
@@ -26,7 +26,7 @@ const os = require('node:os')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -35,24 +35,23 @@ const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
 const SESSION_COOKIE_LIMIT = 4096
 const SELF_PATH = path.resolve(__filename)
 // realpath of our own file: realpath also expands 8.3 short names
-// (ETASE~1.JS), so comparing resolved paths covers them. Note Windows
-// realpathSync does NOT normalize case, hence isSelfPath() below
-// compares case-insensitively on win32
+// (ETASE~1.JS), so comparing resolved paths covers them. Note
+// realpathSync does NOT normalize case on case-insensitive file
+// systems, hence isSelfPath() below compares case-insensitively
 const SELF_PATH_REAL = (() => {
   try { return fs.realpathSync(SELF_PATH) } catch (e) { return SELF_PATH }
 })()
 
-// self-protection predicate: case-insensitive on win32, where the
-// file system happily opens 'ETA-SERVER.js' for 'eta-server.js' and
-// a raw string comparison would miss the variant entirely
+// self-protection predicate: case-insensitive on EVERY platform, not
+// just win32 — macOS APFS (default configuration) and case-insensitive
+// mounts on Linux (NTFS / exFAT / Docker Desktop binds) also open
+// 'ETA-SERVER.js' for 'eta-server.js', and realpath normalizes case
+// on none of them. Worst case: a same-directory file differing only
+// in case from the server's own name gets one extra 404
 function isSelfPath (p) {
-  if (p === SELF_PATH || p === SELF_PATH_REAL) return true
-  if (process.platform === 'win32') {
-    const lp = String(p).toLowerCase()
-    return lp === SELF_PATH.toLowerCase() ||
-      lp === SELF_PATH_REAL.toLowerCase()
-  }
-  return false
+  const lp = String(p).toLowerCase()
+  return lp === SELF_PATH.toLowerCase() ||
+    lp === SELF_PATH_REAL.toLowerCase()
 }
 
 // extension whitelist for static files (fail-closed outside this table)
@@ -112,6 +111,13 @@ const HOP_BY_HOP_HEADERS = {
   'transfer-encoding': 1, 'upgrade': 1,
 }
 
+// list-based response headers that legitimately carry multiple
+// values: repeated RESP.header() calls accumulate (emitted joined by
+// ', ' per RFC 9110 list syntax) instead of the usual last-write-wins
+const MULTI_VALUE_HEADERS = {
+  'link': 1, 'www-authenticate': 1, 'proxy-authenticate': 1,
+}
+
 /* ---------------------------------------------------------------------
  * utilities
  * ------------------------------------------------------------------- */
@@ -154,33 +160,19 @@ function req_HEAD (res) {
   return res.req && res.req.method === 'HEAD'
 }
 
-// stable per-machine secret: hostname + user + home + first real MAC
-// + document root (per-site key: same machine, different roots get
-// different secrets, so a session cookie from site A never verifies
-// on site B even when both run on this host)
-function deriveSecret (rootDir) {
-  let rootReal = ''
-  try {
-    rootReal = fs.realpathSync(rootDir)
-  } catch (e) {
-    rootReal = path.resolve(rootDir)
-  }
-  // mix in ALL non-zero MACs sorted: enumeration order of the first
-  // interface is not stable across reboots (and may pick a virtual
-  // adapter), which would silently invalidate every session
-  const macs = []
-  try {
-    const ifs = os.networkInterfaces()
-    for (const key of Object.keys(ifs)) {
-      for (const item of ifs[key] || []) {
-        if (item.mac && item.mac !== '00:00:00:00:00:00') {
-          macs.push(item.mac)
-        }
-      }
-    }
-  } catch (e) { /* ignore */ }
-  macs.sort()
-  const mac = macs.join(',')
+// per-user persistent random master secret: ~/.eta-server-secret
+// (mode 0600). The old design derived the secret from a machine
+// fingerprint including every NIC MAC — but os.networkInterfaces()
+// only reports currently-active interfaces, so starting/stopping WSL
+// or VMware, connecting a VPN or unplugging a cable changed the MAC
+// set and silently invalidated every session. A persisted random
+// secret is immune to all of that, and keeps sessions valid across
+// server restarts as a bonus. Falls back to a diskless fingerprint
+// (hostname / user / home — deliberately WITHOUT MACs) when the home
+// directory is not writable.
+let masterSecret = null
+
+function fingerprintSeed () {
   let username = ''
   let home = ''
   try {
@@ -190,9 +182,57 @@ function deriveSecret (rootDir) {
   } catch (e) {
     home = os.homedir()
   }
-  const seed = ['eta-server', os.hostname(), username, home, mac,
-    rootReal].join('|')
-  return crypto.createHash('sha256').update(seed).digest('hex')
+  return ['eta-server', os.hostname(), username, home].join('|')
+}
+
+function loadMasterSecret () {
+  if (masterSecret) return masterSecret
+  let dir = ''
+  try {
+    dir = path.join(os.homedir(), '.eta-server')
+  } catch (e) {
+    dir = ''
+  }
+  if (dir) {
+    const file = path.join(dir, 'session-secret')
+    try {
+      const text = fs.readFileSync(file, 'utf8').trim()
+      if (/^[0-9a-f]{64}$/.test(text)) {
+        masterSecret = text
+        return masterSecret
+      }
+    } catch (e) { /* not created yet */ }
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      const fresh = crypto.randomBytes(32).toString('hex')
+      // 0600: the secret must not be world-readable (the mode is a
+      // no-op on Windows, which protects the profile directory itself)
+      fs.writeFileSync(file, fresh + '\n', { mode: 0o600 })
+      masterSecret = fresh
+      return masterSecret
+    } catch (e) { /* fall through to the fingerprint below */ }
+  }
+  console.error('eta-server: warning: cannot persist a session secret ' +
+    'in the home directory; falling back to a machine fingerprint')
+  masterSecret = crypto.createHash('sha256')
+    .update(fingerprintSeed()).digest('hex')
+  return masterSecret
+}
+
+// stable per-site secret: HMAC of the document root's realpath keyed
+// by the master secret — same machine, different roots get different
+// secrets, so a session cookie from site A never verifies on site B
+// even when both run on this host (per-site isolation kept from the
+// fingerprint design)
+function deriveSecret (rootDir) {
+  let rootReal = ''
+  try {
+    rootReal = fs.realpathSync(rootDir)
+  } catch (e) {
+    rootReal = path.resolve(rootDir)
+  }
+  return crypto.createHmac('sha256', loadMasterSecret())
+    .update('eta-server-session|' + rootReal).digest('hex')
 }
 
 // percent-encode a decoded path for use in a Location header (each
@@ -306,14 +346,12 @@ function parseForm (buf) {
 // covers every dispatcher branch — template, static, redirect, error).
 // Destination defaults to stderr (stdout stays clean in every mode,
 // including piping); --access-log <file> appends to a file; --quiet
-// silences it. Process-global by design: this is immutable startup
-// configuration, not per-request state (decision #14).
+// silences it. The destination is per server instance (stored on ctx
+// at startServer time), not a process global: a second startServer()
+// in the same process must not silently redirect the first server's
+// log. Immutable startup config, not per-request state (decision #14).
 const LOG_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
-const logConfig = {
-  access: process.stderr,   // writable stream, or null when --quiet
-}
 
 function pad2 (n) {
   return n < 10 ? '0' + n : String(n)
@@ -415,13 +453,47 @@ function realInside (rootReal, abs) {
   return containsPath(rootReal, real) ? real : null
 }
 
+// hidden-path convention (decision #17): segments starting with '_' or
+// '.', plus node_modules directories, are never served — not as
+// templates, not as static files, not as directory indexes, fail-closed
+// 404 indistinguishable from "does not exist". Decision #9's
+// thin-template architecture pushes logic into library files under the
+// docroot; those (and config files) belong behind such names, mirroring
+// PHP ecosystems where .php sources / .htaccess / underscore includes
+// are never emitted raw. The _404.eta fallback page is private by the
+// same rule.
+function isPrivateSegment (seg) {
+  return seg === 'node_modules' || seg.charAt(0) === '_' ||
+    seg.charAt(0) === '.'
+}
+
+// URL level: pathname always starts with '/', the empty first segment
+// never matches
+function isPrivatePathname (pathname) {
+  for (const seg of pathname.split('/')) {
+    if (isPrivateSegment(seg)) return true
+  }
+  return false
+}
+
+// realpath level: relative against the real root, catching symlinks
+// inside the root whose TARGET lives under a private name
+function isPrivateReal (rootReal, real) {
+  if (real === rootReal) return false
+  const rel = path.relative(rootReal, real)
+  if (rel === '' || path.isAbsolute(rel)) return true   // fail-closed
+  return isPrivatePathname('/' + rel.split(path.sep).join('/'))
+}
+
 /* ---------------------------------------------------------------------
  * response control object injected into templates as RESP
  * ------------------------------------------------------------------- */
 
-function makeResp () {
+function makeResp (defaultStatus) {
   const resp = {
-    code: 200,
+    // fallback pages (_404.eta) start at 404 instead of 200; the
+    // script may still override with RESP.status()
+    code: defaultStatus || 200,
     headers: [],                 // list of [name, value] pairs
     binary: null,                // writeraw buffer, null until touched
     text: null,                  // RESP.json() body, null until set
@@ -538,7 +610,8 @@ function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx,
   // REQUEST_TIME marks the arrival of the request, not the moment the
   // body upload finished)
   const now = reqStart || Date.now()
-  const env = {
+  const env = Object.create(null)
+  Object.assign(env, {
     REQUEST_METHOD: req.method,
     QUERY_STRING: parsed.queryString,
     REQUEST_URI: req.url,
@@ -556,7 +629,7 @@ function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx,
     SERVER_PROTOCOL: 'HTTP/' + (req.httpVersion || '1.1'),
     REQUEST_TIME: Math.floor(now / 1000),
     REQUEST_TIME_FLOAT: now / 1000,
-  }
+  })
   for (const key of Object.keys(headers)) {
     const name = 'HTTP_' + key.toUpperCase().replace(/-/g, '_')
     if (!(name in env)) env[name] = String(headers[key])
@@ -565,7 +638,8 @@ function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx,
 }
 
 async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
-  pathInfo, reqStart) {
+  pathInfo, reqStart, opts) {
+  opts = opts || {}
   let bodyBuf = Buffer.alloc(0)
   try {
     bodyBuf = await readBody(req)
@@ -584,7 +658,12 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   let post = Object.create(null)
   let jsonVal = null
   const ctype = String(req.headers['content-type'] || '')
-  if (ctype.indexOf('application/x-www-form-urlencoded') >= 0) {
+  if (ctype.indexOf('multipart/form-data') >= 0) {
+    // _FILES is phase two; without this line a multipart form would
+    // "submit successfully" with every parameter silently missing
+    console.error('eta-server: warning: multipart/form-data body is not ' +
+      'parsed (no _FILES yet); _POST stays empty, raw bytes in _BODY')
+  } else if (ctype.indexOf('application/x-www-form-urlencoded') >= 0) {
     post = parseForm(bodyBuf)
   } else if (ctype.indexOf('json') >= 0) {
     // any json-ish content type (application/json, application/*+json,
@@ -600,7 +679,7 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   const session = decodeSession(cookies[SESSION_COOKIE], ctx.secret) || {}
   const hadSessionCookie = (SESSION_COOKIE in cookies)
 
-  const resp = makeResp()
+  const resp = makeResp(opts.defaultStatus)
   const data = {
     _GET: query,
     _POST: post,
@@ -623,6 +702,10 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     const src = stripBom(fs.readFileSync(scriptAbs, 'utf8'))
     html = await ctx.eta.renderStringAsync(src, data)
   } catch (err) {
+    if (opts.plain404OnError) {
+      // fallback pages must never turn a 404 into anything else
+      return sendError(res, 404, 'Not Found')
+    }
     const detail = (err && err.stack) ? err.stack : String(err)
     return sendError(res, 500, 'Internal Server Error', detail)
   }
@@ -635,8 +718,27 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
       'invalid status code: ' + resp.code)
   }
 
-  // ---- assemble response headers ----
-  const headers = { 'Content-Type': 'text/html; charset=utf-8' }
+  // ---- session reassignment: the template may replace _SESSION
+  // wholesale (`_SESSION = {}` is PHP users' natural session-clear
+  // idiom); with(useWith) the assignment lands on data._SESSION, so
+  // re-read it here — trusting only the pre-render capture would
+  // silently discard the reassignment ----
+  let sessionOut = session
+  if (data._SESSION !== session) {
+    if (data._SESSION === null || data._SESSION === undefined) {
+      sessionOut = {}                       // null clears the session
+    } else if (typeof data._SESSION === 'object') {
+      sessionOut = data._SESSION            // {} / [] / new dict
+    } else {
+      console.error('eta-server: warning: _SESSION was reassigned to a ' +
+        'non-object value and the reassignment is ignored')
+    }
+  }
+
+  // ---- assemble response headers: normalized by lowercased name
+  // (case variants can no longer duplicate a header), Content-Length
+  // unconditionally framework-owned, list-based names accumulate ----
+  const hmap = new Map()          // lowercased name -> [displayName, values[]]
   const setCookies = []
   for (const pair of resp.headers) {
     const name = pair[0]
@@ -645,19 +747,45 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
       setCookies.push(pair[1])
       continue
     }
+    if (lname === 'content-length') {
+      // a template-set CL can only ever contradict the buffered body
+      // (broken responses / smuggling surface), hence drop + warn
+      console.error('eta-server: warning: RESP.header("' + name + '") ' +
+        'targets the framework-owned Content-Length and is ignored')
+      continue
+    }
     if (HOP_BY_HOP_HEADERS[lname]) {
       // hop-by-hop headers are framework-owned (see HOP_BY_HOP_HEADERS)
       console.error('eta-server: warning: RESP.header("' + name + '") is ' +
         'a hop-by-hop header and is ignored')
       continue
     }
-    headers[name] = pair[1]
+    const entry = hmap.get(lname)
+    if (entry) {
+      entry[0] = name               // display case: last writer wins
+      entry[1].push(pair[1])
+    } else {
+      hmap.set(lname, [name, [pair[1]]])
+    }
+  }
+
+  // 204 / 205 / 304 never carry a body: drop the residual template
+  // bytes AND Content-Length / Content-Type (RFC 7230/7231; strict
+  // proxies reject the combination)
+  const noBody = resp.code === 204 || resp.code === 205 || resp.code === 304
+
+  const headers = {}
+  for (const [lname, entry] of hmap) {
+    if (noBody && lname === 'content-type') continue
+    const values = entry[1]
+    headers[entry[0]] = (values.length > 1 && MULTI_VALUE_HEADERS[lname])
+      ? values : values[values.length - 1]
   }
 
   // ---- session cookie: re-sign (sliding) when session has data ----
-  if (Object.keys(session).length > 0) {
-    const sessCookie = SESSION_COOKIE + '=' + encodeSession(session, ctx.secret) +
-      '; Path=/; HttpOnly; SameSite=Lax'
+  if (Object.keys(sessionOut).length > 0) {
+    const sessCookie = SESSION_COOKIE + '=' +
+      encodeSession(sessionOut, ctx.secret) + '; Path=/; HttpOnly; SameSite=Lax'
     if (Buffer.byteLength(sessCookie, 'utf8') > SESSION_COOKIE_LIMIT) {
       // browsers silently drop oversized cookies; fail loudly instead
       return sendError(res, 500, 'Internal Server Error',
@@ -669,6 +797,16 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
       '; Max-Age=0')
   }
   if (setCookies.length > 0) headers['Set-Cookie'] = setCookies
+
+  if (noBody) {
+    res.writeHead(resp.code, headers)
+    res.end()
+    return
+  }
+
+  if (!('Content-Type' in headers) && !hmap.has('content-type')) {
+    headers['Content-Type'] = 'text/html; charset=utf-8'
+  }
 
   // ---- pick body: binary short-circuit > RESP.json() > rendered html ----
   let body = html
@@ -689,10 +827,24 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
  * ------------------------------------------------------------------- */
 
 function sendStatic (req, res, abs, type) {
+  // open once, fstat the SAME fd: a stat-then-stream pair can observe
+  // two generations of the file when it is rewritten in between, and
+  // the declared Content-Length would disagree with the streamed bytes
+  let fd = null
+  try {
+    fd = fs.openSync(abs, 'r')
+  } catch (e) {
+    return sendError(res, 404, 'Not Found')
+  }
   let stat = null
   try {
-    stat = fs.statSync(abs)
+    stat = fs.fstatSync(fd)
   } catch (e) {
+    try { fs.closeSync(fd) } catch (e2) { /* ignore */ }
+    return sendError(res, 404, 'Not Found')
+  }
+  if (!stat.isFile()) {
+    try { fs.closeSync(fd) } catch (e) { /* ignore */ }
     return sendError(res, 404, 'Not Found')
   }
   res.writeHead(200, {
@@ -700,10 +852,12 @@ function sendStatic (req, res, abs, type) {
     'Content-Length': stat.size
   })
   if (req.method === 'HEAD') {
+    try { fs.closeSync(fd) } catch (e) { /* ignore */ }
     res.end()
     return
   }
-  const stream = fs.createReadStream(abs)
+  // fd handed over to the stream (autoClose releases it on end/error)
+  const stream = fs.createReadStream(abs, { fd })
   stream.on('error', () => {
     try { res.destroy() } catch (e) { /* ignore */ }
   })
@@ -713,6 +867,39 @@ function sendStatic (req, res, abs, type) {
 /* ---------------------------------------------------------------------
  * request dispatcher
  * ------------------------------------------------------------------- */
+
+// degraded parse result for requests whose URL failed to parse: just
+// enough structure for the 404 fallback template to render
+function fallbackParsed (req) {
+  const p = new URL('/', 'http://localhost')
+  const url = req.url || ''
+  const i = url.indexOf('?')
+  p.queryString = i >= 0 ? url.slice(i + 1) : ''
+  return p
+}
+
+// 404 with an optional custom error page (decision #17): when the
+// document root contains a '_404.eta' script it is rendered with a
+// default status of 404 (the script may override via RESP.status()).
+// The underscore convention keeps the file itself unroutable, so the
+// fallback can never recurse; a missing or broken fallback degrades
+// to the built-in error page — never to a non-404
+async function sendNotFound (req, res, ctx, parsed, reqStart) {
+  const fb = path.join(ctx.root, '_404.eta')
+  let st = null
+  try {
+    st = fs.statSync(fb)
+  } catch (e) { /* no fallback */ }
+  if (st && st.isFile()) {
+    const real = realInside(ctx.rootReal, fb)
+    if (real && !isSelfPath(real)) {
+      return renderTemplate(req, res, ctx, parsed || fallbackParsed(req),
+        fb, '/_404.eta', '', reqStart,
+        { defaultStatus: 404, plain404OnError: true })
+    }
+  }
+  return sendError(res, 404, 'Not Found')
+}
 
 async function handleRequest (req, res, ctx) {
   // PHP semantics: REQUEST_TIME marks request arrival, captured before
@@ -737,10 +924,10 @@ async function handleRequest (req, res, ctx) {
     parsed = new URL(req.url, 'http://localhost')
     pathname = decodeURIComponent(parsed.pathname)
   } catch (e) {
-    return sendError(res, 404, 'Not Found')
+    return sendNotFound(req, res, ctx, null, reqStart)
   }
   if (pathname.indexOf('\0') >= 0) {
-    return sendError(res, 404, 'Not Found')
+    return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   if (pathname.indexOf('//') >= 0) {
     // %2f-encoded slashes survive the raw check above; normalize them
@@ -761,7 +948,7 @@ async function handleRequest (req, res, ctx) {
     // CON.txt, ...) cannot be served as regular files: fail-closed
     for (const seg of pathname.split('/')) {
       if (seg && win32BadSegment(seg)) {
-        return sendError(res, 404, 'Not Found')
+        return sendNotFound(req, res, ctx, parsed, reqStart)
       }
     }
   }
@@ -771,14 +958,14 @@ async function handleRequest (req, res, ctx) {
   const root = ctx.root
   let target = path.resolve(root, '.' + pathname)
   if (!containsPath(root, target)) {
-    return sendError(res, 404, 'Not Found')
+    return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   // ---- self-protection, fast path: exact / case-variant / 8.3 match
   // against the server's own file. Checked again after realpath
   // resolution below (symlinked / junctioned routes to the same real
   // file are covered there) ----
   if (isSelfPath(target)) {
-    return sendError(res, 404, 'Not Found')
+    return sendNotFound(req, res, ctx, parsed, reqStart)
   }
 
   // ---- template branch: xxx.eta or xxx.eta/PATH_INFO ----
@@ -794,29 +981,39 @@ async function handleRequest (req, res, ctx) {
       pathInfo = pathname.slice(i + 4)
     }
   }
+  // ---- hidden-path convention (decision #17): checked on the file
+  // part only — the PATH_INFO tail of a real script is data, not a
+  // file path, so '/api.eta/_user/1' stays legal ----
+  if (isPrivatePathname(scriptRel !== null ? scriptRel : pathname)) {
+    return sendNotFound(req, res, ctx, parsed, reqStart)
+  }
   if (scriptRel !== null) {
     const scriptAbs = path.resolve(root, '.' + scriptRel)
     if (!containsPath(root, scriptAbs)) {
-      return sendError(res, 404, 'Not Found')
+      return sendNotFound(req, res, ctx, parsed, reqStart)
     }
     let stat = null
     try {
       stat = fs.statSync(scriptAbs)
-    } catch (e) {
-      return sendError(res, 404, 'Not Found')
+    } catch (e) { /* handled below */ }
+    if (stat && stat.isFile()) {
+      // realpath containment: a symlink / junction inside root pointing
+      // outside must not be rendered; a route whose real location is
+      // the server's own file or a hidden name is 404 too
+      const realScript = realInside(ctx.rootReal, scriptAbs)
+      if (!realScript || isSelfPath(realScript) ||
+        isPrivateReal(ctx.rootReal, realScript)) {
+        return sendNotFound(req, res, ctx, parsed, reqStart)
+      }
+      return renderTemplate(req, res, ctx, parsed, scriptAbs, scriptRel,
+        pathInfo, reqStart)
     }
-    if (!stat.isFile()) {
-      return sendError(res, 404, 'Not Found')
+    if (!stat) {
+      return sendNotFound(req, res, ctx, parsed, reqStart)
     }
-    // realpath containment: a symlink / junction inside root pointing
-    // outside must not be rendered; a route whose real location is the
-    // server's own file is 404 too
-    const realScript = realInside(ctx.rootReal, scriptAbs)
-    if (!realScript || isSelfPath(realScript)) {
-      return sendError(res, 404, 'Not Found')
-    }
-    return renderTemplate(req, res, ctx, parsed, scriptAbs, scriptRel,
-      pathInfo, reqStart)
+    // a DIRECTORY whose name contains '.eta': the PATH_INFO split
+    // applies to files only, so fall through to the directory / static
+    // branch below (its target covers the full pathname)
   }
 
   // ---- directory branch: 301 slash, then index fallbacks ----
@@ -824,15 +1021,16 @@ async function handleRequest (req, res, ctx) {
   try {
     stat = fs.statSync(target)
   } catch (e) {
-    return sendError(res, 404, 'Not Found')
+    return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   // realpath containment applies to both directories and static files:
   // a symlink / junction escaping the root is a plain 404 — as is any
-  // route whose real location resolves to the server's own file
-  // (case-insensitive on win32, 8.3 short names expanded by realpath)
+  // route whose real location resolves to the server's own file (case-
+  // insensitive everywhere, 8.3 short names expanded by realpath) or
+  // to a hidden name (a symlink pointing at '_private/' inside root)
   const real = realInside(ctx.rootReal, target)
-  if (!real || isSelfPath(real)) {
-    return sendError(res, 404, 'Not Found')
+  if (!real || isSelfPath(real) || isPrivateReal(ctx.rootReal, real)) {
+    return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   if (stat.isDirectory()) {
     if (!pathname.endsWith('/')) {
@@ -850,8 +1048,9 @@ async function handleRequest (req, res, ctx) {
         // target inside the root escapes the containment check, so
         // isSelfPath is the only guard here)
         const realIdx = realInside(ctx.rootReal, idxEta)
-        if (!realIdx || isSelfPath(realIdx)) {
-          return sendError(res, 404, 'Not Found')
+        if (!realIdx || isSelfPath(realIdx) ||
+          isPrivateReal(ctx.rootReal, realIdx)) {
+          return sendNotFound(req, res, ctx, parsed, reqStart)
         }
         const name = pathname + 'index.eta'
         return renderTemplate(req, res, ctx, parsed, idxEta, name, '',
@@ -863,28 +1062,29 @@ async function handleRequest (req, res, ctx) {
       try {
         if (fs.statSync(f).isFile()) {
           const realF = realInside(ctx.rootReal, f)
-          if (!realF || isSelfPath(realF)) {
-            return sendError(res, 404, 'Not Found')
+          if (!realF || isSelfPath(realF) ||
+            isPrivateReal(ctx.rootReal, realF)) {
+            return sendNotFound(req, res, ctx, parsed, reqStart)
           }
           // Content-Type judged by the realpath extension (decision
           // #12), not the symlink's own name; outside the whitelist
           // stays fail-closed 404 (no fallback to the next candidate)
           const type = STATIC_TYPES[path.extname(realF).toLowerCase()]
           if (!type) {
-            return sendError(res, 404, 'Not Found')
+            return sendNotFound(req, res, ctx, parsed, reqStart)
           }
           return sendStatic(req, res, realF, type)
         }
       } catch (e) { /* keep looking */ }
     }
-    return sendError(res, 404, 'Not Found')
+    return sendNotFound(req, res, ctx, parsed, reqStart)
   }
 
   // ---- static file branch: whitelist + method check ----
   const ext = path.extname(real).toLowerCase()
   const type = STATIC_TYPES[ext]
   if (!type) {
-    return sendError(res, 404, 'Not Found')
+    return sendNotFound(req, res, ctx, parsed, reqStart)
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { 'Allow': 'GET, HEAD' })
@@ -946,7 +1146,7 @@ async function renderCli (script, args) {
     _GET: Object.create(null),
     _POST: Object.create(null),
     _REQUEST: Object.create(null),
-    _SERVER: {
+    _SERVER: Object.assign(Object.create(null), {
       REQUEST_METHOD: 'GET',
       QUERY_STRING: '',
       SCRIPT_NAME: scriptAbs,
@@ -961,7 +1161,7 @@ async function renderCli (script, args) {
       REQUEST_TIME: Math.floor(now / 1000),
       REQUEST_TIME_FLOAT: now / 1000,
       argv: [script].concat(args),
-    },
+    }),
     _COOKIE: Object.create(null),
     _SESSION: {},
     _BODY: Buffer.alloc(0),
@@ -1005,6 +1205,9 @@ function startServer (rootDir, port, host, options) {
   host = host || '127.0.0.1'
   options = options || {}
 
+  // access-log destination is per instance (on ctx), NOT a module
+  // global: a second startServer() must not re-route the first one's
+  // log. --quiet takes precedence over an explicit destination
   const ctx = {
     root: root,
     rootReal: fs.realpathSync(root),
@@ -1012,11 +1215,17 @@ function startServer (rootDir, port, host, options) {
     port: port,
     secret: deriveSecret(root),
     eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
+    accessLog: options.quiet ? null : openAccessLog(options.accessLog),
   }
 
-  // --quiet takes precedence over an explicit access-log destination
-  logConfig.access = options.quiet ? null
-    : openAccessLog(options.accessLog)
+  // loopback binds are the intended usage; anything else deserves a
+  // loud reminder that 500 pages expose stack traces + absolute paths
+  const LOOPBACK_HOSTS = { '127.0.0.1': 1, 'localhost': 1, '::1': 1 }
+  if (!LOOPBACK_HOSTS[host]) {
+    console.error('eta-server: warning: binding to non-loopback address ' +
+      '"' + host + '" — this is a trusted-environment dev server; ' +
+      '500 pages expose full stack traces and absolute paths')
+  }
 
   const server = http.createServer((req, res) => {
     const start = Date.now()
@@ -1025,7 +1234,7 @@ function startServer (rootDir, port, host, options) {
     // 'finish' covers every dispatcher branch without touching them;
     // aborted connections (destroyed before completion) are not logged
     res.on('finish', () => {
-      const stream = logConfig.access
+      const stream = ctx.accessLog
       if (stream) stream.write(accessLine(req, res, state, start) + '\n')
     })
     handleRequest(req, res, ctx).catch((err) => {

@@ -107,7 +107,7 @@ All bridge names are available bare in templates (thanks to Eta `useWith`); the 
 | `_GET` / `_POST` / `_REQUEST` | query params / form-urlencoded body / merged (POST wins) |
 | `_SERVER` | request environment: `REQUEST_METHOD`, `QUERY_STRING`, `REQUEST_URI`, `SCRIPT_NAME`, `PATH_INFO`, `SCRIPT_FILENAME`, `SCRIPT_DIRNAME`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME`, `SERVER_PORT`, `REQUEST_SCHEME`, `SERVER_PROTOCOL`, `REQUEST_TIME` / `REQUEST_TIME_FLOAT`, `HTTP_*` headers, plus `argv` in CLI mode |
 | `_COOKIE` | cookie dict (values percent-decoded) |
-| `_SESSION` | session object — signed-cookie based, no server-side storage, sliding 30-minute timeout. Mutate in place; don't reassign the whole object |
+| `_SESSION` | session object — signed-cookie based, no server-side storage, sliding 30-minute timeout. Mutate in place, or reassign the whole object (`_SESSION = {}`) to clear it |
 | `_BODY` | raw request body (Buffer, like `php://input`) |
 | `_JSON` | parsed JSON body when Content-Type contains `json`, else `null` |
 | `RESP.status(code)` | set response status code |
@@ -142,13 +142,15 @@ Only erasable syntax is allowed (type annotations / interface / type / generics 
 ## Request semantics
 
 - Requesting `xxx.eta` renders it; non-`.eta` requests are served statically from a **built-in extension whitelist** (html, txt, css, js, json, common images, fonts, audio/video, pdf, wasm, archives — full list in the spec). Anything outside the whitelist is 404 (fail-closed).
+- **Hidden paths**: segments starting with `_` or `.`, and `node_modules`, are never served (404). Keep server-side libraries and config files behind such names — `_lib/util.ts`, `_config.json` — plain assets stay public.
+- **Custom 404 pages**: drop a `_404.eta` into the docroot and every 404 renders it (default status 404; the script may override).
 - Static files accept GET/HEAD only (others get 405); `.eta` scripts are rendered for all methods, with `REQUEST_METHOD` passed through.
-- Directories: a missing trailing slash gets a 301 redirect, then `index.eta` → `index.html` → `index.htm` is tried.
+- Directories: a missing trailing slash gets a 301 redirect, then `index.eta` → `index.html` → `index.htm` is tried. A directory whose name contains `.eta` is served normally (the script/PATH_INFO split applies to files only).
 - `PATH_INFO`: requesting `hello.eta/foo/bar` renders `hello.eta` with `_SERVER.PATH_INFO = '/foo/bar'`.
 - Templates are re-read and re-compiled on every request — edit, refresh, done.
 - Errors in a script produce a 500 page with the escaped error and stack trace.
 - Request body cap: 64MB (413 beyond it). Path traversal, symlink/junction escapes and other filesystem tricks are all rejected with 404.
-- Sessions are signed cookies (HMAC-SHA256, key derived from a machine + document-root fingerprint). Data is tamper-proof but visible to the client — don't store secrets.
+- Sessions are signed cookies (HMAC-SHA256, key derived from a random per-user secret persisted in your home directory, mixed with the document root). `_SESSION = {}` clears the session. Data is tamper-proof but visible to the client — don't store secrets.
 
 ## CLI render mode
 
