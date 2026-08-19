@@ -16,12 +16,12 @@ eta-server is a PHP-style dynamic page server for `.eta` templates: the file pat
 ## Directory layout
 
 ```
-eta-server.js      main program (single file, HTTP server + CLI render, ~1700 lines)
+eta-server.js      main program (single file, HTTP server + CLI render, ~1900 lines)
 package.json       npm package definition (bin: eta-server; files include docs/prd.md docs/spec.md)
 docs/prd.md        product requirements
 docs/spec.md       technical spec and decision log
 demo/              demo site (doubles as test fixture — tests assert on demo content)
-tests/test_server.js   HTTP mode tests (spawned child process, port 5177, 71 checks; symlink probes self-SKIP without privilege, 8.3 probes self-SKIP on volumes without short names)
+tests/test_server.js   HTTP mode tests (spawned child process, port 5177, 78 checks; symlink probes self-SKIP without privilege, 8.3 probes self-SKIP on volumes without short names)
 tests/test_cli.js      CLI render mode tests (spawnSync assertions)
 ```
 

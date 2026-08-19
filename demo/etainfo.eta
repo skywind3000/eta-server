@@ -52,6 +52,21 @@ function sortedEntries (obj) {
   return Object.keys(obj).sort().map(k => [k, obj[k]])
 }
 
+// phpinfo() dumping every environment variable is how production
+// secrets end up on a public page, so this demo models the safer habit:
+// values whose NAME looks sensitive are masked. eta-server's own
+// session signing key can be passed as ETA_SERVER_SECRET, and it would
+// otherwise be printed right here for anyone who can load this page.
+// Masking a name is a convenience, not a security boundary — templates
+// are arbitrary JavaScript and can always read process.env themselves
+const SECRET_NAME_RE =
+  /SECRET|TOKEN|PASS(WORD|WD)?|CREDENTIAL|PRIVATE|SESSION_KEY|AUTH|(^|_)KEY(_|$)|API_?KEY/i
+
+function envEntries () {
+  return sortedEntries(process.env).map(
+    (p) => SECRET_NAME_RE.test(p[0]) ? [p[0], '(masked by etainfo)'] : p)
+}
+
 // require is anchored at the template directory; bare specifiers climb these
 // directories looking for node_modules
 function moduleSearchPaths () {
@@ -91,6 +106,7 @@ td.e {background:#ccccff; font-weight:bold; width:300px;}
 td.v {background:#f8f8ff; word-break:break-all; white-space:pre-wrap;}
 td.h {background:#666699; color:#fff; font-weight:bold;}
 p.foot {color:#888; margin-top:30px;}
+p.note {color:#666; margin:4px 0 6px 0;}
 a {color:#666699;}
 </style>
 </head>
@@ -143,8 +159,10 @@ a {color:#666699;}
 </table>
 
 <h2>Environment Variables (process.env)</h2>
+<p class="note">Names that look like secrets are masked — see the comment at
+the top of this template.</p>
 <table>
-<%~ kvRows(sortedEntries(process.env)) %>
+<%~ kvRows(envEntries()) %>
 </table>
 
 <h2>Paths</h2>

@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/20 02:10:00
+ * Last Modified: 2026/08/20 03:20:00
  *
  * ===================================================================== */
 'use strict'
@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.4.2'
+const VERSION = '0.4.3'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -464,7 +464,10 @@ function accessLine (req, res, state, start, ctx) {
     ? forwardedClientIp(req.headers) : '') ||
     (req.socket && req.socket.remoteAddress) || '-'
   const ms = Date.now() - start
-  return remote + ' - - [' + formatCltTime(new Date(start)) + '] "' +
+  // the client field is escaped like the request line: forwarded
+  // addresses are validated as IP literals (decision #23), so this is
+  // belt-and-braces for anything else that could ever land here
+  return clfEscape(remote) + ' - - [' + formatCltTime(new Date(start)) + '] "' +
     clfEscape(req.method) + ' ' + clfEscape(req.url) +
     ' HTTP/' + req.httpVersion + '" ' +
     res.statusCode + ' ' + responseBytes(state) + ' ' + ms + 'ms'
@@ -545,17 +548,64 @@ function buildAllowedHosts (host, spec) {
 // owns the port. Without it they stay ignored, so a rebound page cannot
 // forge a client IP.
 
+// forwarded values are attacker-controlled input: --behind-proxy only
+// asserts that a proxy owns the port, it cannot make the header
+// contents true, and anything reaching the port directly picks them.
+// An unvalidated address forged a whole CLF field prefix in the access
+// log ('1.2.3.4 - - [pwned] "GET /x" 200 0' — header values may
+// contain spaces and quotes, only control characters are rejected by
+// llhttp) and handed templates arbitrary text where _SERVER.REMOTE_ADDR
+// promises an address. So a value that is not an IP literal is dropped
+// in favour of the real peer, the same way Apache mod_remoteip and
+// Express 'trust proxy' validate theirs (decision #23)
+function normalizeIp (value) {
+  let v = String(value).trim()
+  if (!v) return ''
+  // some proxies append the source port: '[2001:db8::1]:443' or
+  // '192.0.2.1:1234' — the address is the part we want
+  if (v.charAt(0) === '[') {
+    const i = v.indexOf(']')
+    if (i > 0) v = v.slice(1, i)
+  } else if (v.indexOf(':') > 0 && v.indexOf(':') === v.lastIndexOf(':')) {
+    v = v.slice(0, v.indexOf(':'))
+  }
+  return net.isIP(v) !== 0 ? v : ''
+}
+
+// host grammar, RFC 1123 shape with underscores allowed: they are
+// illegal in a strict reading but ordinary in dev setups (docker
+// container names, 'my_app.local') and harmless in the HTML / URL
+// contexts templates build out of SERVER_NAME. The point of this check
+// is to keep quotes, angle brackets and spaces out, not to police DNS
+const HOSTNAME_RE =
+  /^[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*\.?$/
+
+// the forwarded host lands in _SERVER.SERVER_NAME, out of which
+// templates build URLs and links. The Host header is safe by
+// construction on the normal path (it passed the allowlist first), but
+// --behind-proxy skips that check, so both channels get validated here.
+// Deliberately NOT folded into hostnameOf(): that function feeds the
+// allowlist, where an empty return means "no Host at all" and is
+// ALLOWED — rejecting junk there would turn a malformed Host into a
+// bypass (decision #23)
+function validHostname (name) {
+  if (!name) return ''
+  if (net.isIP(name) !== 0) return name
+  if (name.length > 253) return ''
+  return HOSTNAME_RE.test(name) ? name : ''
+}
+
 // leftmost X-Forwarded-For entry is the original client (each hop
 // appends its peer); X-Real-IP is nginx's single-value equivalent
 function forwardedClientIp (headers) {
   const xff = headers['x-forwarded-for']
   if (xff) {
-    const first = String(xff).split(',')[0].trim()
+    const first = normalizeIp(String(xff).split(',')[0])
     if (first) return first
   }
   const real = headers['x-real-ip']
   if (real) {
-    const one = String(real).trim()
+    const one = normalizeIp(real)
     if (one) return one
   }
   return ''
@@ -878,9 +928,12 @@ function buildServerEnv (req, parsed, scriptAbs, scriptName, pathInfo, ctx,
     // fallback for clients that send no Host at all. X-Forwarded-Host
     // wins when trusted — a proxy that does NOT preserve Host puts the
     // public name only there
+    // validated against the host grammar (decision #23): the allowlist
+    // vouches for the Host header on the normal path, but --behind-proxy
+    // skips it, so neither channel is trusted blindly here
     SERVER_NAME: (ctx.behindProxy
-      ? hostnameOf(headers['x-forwarded-host']) : '') ||
-      hostnameOf(headers['host']) || ctx.host,
+      ? validHostname(hostnameOf(headers['x-forwarded-host'])) : '') ||
+      validHostname(hostnameOf(headers['host'])) || ctx.host,
     SERVER_PORT: String(ctx.port),
     // https terminates at the proxy, so the scheme the client actually
     // used is only knowable from X-Forwarded-Proto
@@ -1083,11 +1136,20 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   }
 
   // ---- session cookie: re-sign (sliding) when session has data ----
+  // Secure is added when the client actually used https, which this
+  // server can only learn from a trusted proxy (node:http never
+  // terminates TLS itself). Without it the session cookie of a
+  // documented reverse-proxy deployment travels over any plain-http
+  // request to the same host; with it, local http development is
+  // untouched because the scheme is then plain http (decision #23)
+  const cookieAttrs = '; Path=/; HttpOnly; SameSite=Lax' +
+    ((ctx.behindProxy && forwardedScheme(req.headers) === 'https')
+      ? '; Secure' : '')
   if (Object.keys(sessionOut).length > 0) {
     let sessCookie = ''
     try {
       sessCookie = SESSION_COOKIE + '=' + encodeSession(sessionOut, ctx.secret) +
-        '; Path=/; HttpOnly; SameSite=Lax'
+        cookieAttrs
     } catch (err) {
       // JSON.stringify throws on a BigInt, a circular structure or a
       // toJSON() that throws. This was the last unguarded throw site
@@ -1121,8 +1183,7 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     }
     setCookies.push(sessCookie)
   } else if (hadSessionCookie) {
-    setCookies.push(SESSION_COOKIE + '=; Path=/; HttpOnly; SameSite=Lax' +
-      '; Max-Age=0')
+    setCookies.push(SESSION_COOKIE + '=' + cookieAttrs + '; Max-Age=0')
   }
   if (setCookies.length > 0) headers['Set-Cookie'] = setCookies
 

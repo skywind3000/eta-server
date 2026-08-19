@@ -7,7 +7,7 @@
  * Requires Node 18+ (global fetch).
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/20 02:10:00
+ * Last Modified: 2026/08/20 03:20:00
  *
  * ===================================================================== */
 'use strict'
@@ -801,6 +801,7 @@ async function main () {
     await check('--behind-proxy trusts X-Forwarded-* and skips the Host check',
       async () => {
         const mod = require(SERVER)
+        writeDemo('t_sessprx.eta', '<% _SESSION.n = 1 %>ok')
         const portP = PORT + 10
         const logP = path.join(os.tmpdir(), 'eta-proxy-' + Date.now() + '.log')
         const srvP = await mod.startServer(ROOT, portP, '127.0.0.1',
@@ -842,6 +843,49 @@ async function main () {
           assert.strictEqual(
             (await rawGet(portQ, 'evil.example', '/index.eta')).status, 403,
             '--allowed-hosts must outrank --behind-proxy')
+          // ---- forwarded values are validated (decision #23) ----
+          // a forged client address used to forge a whole CLF field
+          // prefix, and to hand templates arbitrary text where
+          // REMOTE_ADDR promises an address; junk falls back to the peer
+          const r4 = await rawGet(portP, 'example.com', '/t_fwd.eta', {
+            'X-Forwarded-For': '1.2.3.4 - - [pwned] "GET /x HTTP/1.1" 200 0',
+            'X-Forwarded-Host': 'evil"><script>alert(1)</script>',
+          })
+          assert.strictEqual(r4.body.split('|')[0], '127.0.0.1',
+            'a non-IP X-Forwarded-For must fall back to the peer')
+          assert.strictEqual(r4.body.split('|')[2], 'example.com',
+            'a malformed X-Forwarded-Host must not reach SERVER_NAME')
+          const r5 = await rawGet(portP, 'example.com', '/t_fwd.eta',
+            { 'X-Real-IP': 'not-an-ip;drop table' })
+          assert.strictEqual(r5.body.split('|')[0], '127.0.0.1')
+          // an address with the source port appended is still an address
+          const r6 = await rawGet(portP, 'example.com', '/t_fwd.eta',
+            { 'X-Forwarded-For': '203.0.113.9:51000' })
+          assert.strictEqual(r6.body.split('|')[0], '203.0.113.9')
+          const r7 = await rawGet(portP, 'example.com', '/t_fwd.eta',
+            { 'X-Forwarded-For': '[2001:db8::1]:443' })
+          assert.strictEqual(r7.body.split('|')[0], '2001:db8::1')
+          // underscores are ordinary in dev / docker hostnames
+          const r7b = await rawGet(portP, 'example.com', '/t_fwd.eta',
+            { 'X-Forwarded-Host': 'my_app.local' })
+          assert.strictEqual(r7b.body.split('|')[2], 'my_app.local')
+          await new Promise(r => setTimeout(r, 150))
+          const text2 = fs.readFileSync(logP, 'utf8')
+          assert.ok(text2.indexOf('[pwned]') < 0,
+            'forged CLF fields reached the access log')
+          // ---- session cookie gains Secure on an https request ----
+          const r8 = await rawGet(portP, 'example.com', '/t_sessprx.eta',
+            { 'X-Forwarded-Proto': 'https' })
+          const sc = (r8.headers['set-cookie'] || [])
+            .filter((c) => c.startsWith('etasess='))
+          assert.strictEqual(sc.length, 1)
+          assert.ok(sc[0].indexOf('; Secure') >= 0,
+            'https request must get a Secure session cookie: ' + sc[0])
+          const r9 = await rawGet(portP, 'example.com', '/t_sessprx.eta')
+          const sc9 = (r9.headers['set-cookie'] || [])
+            .filter((c) => c.startsWith('etasess='))
+          assert.ok(sc9[0].indexOf('Secure') < 0,
+            'plain http must not get a Secure cookie: ' + sc9[0])
         } finally {
           if (srvP.closeAllConnections) srvP.closeAllConnections()
           if (srvQ.closeAllConnections) srvQ.closeAllConnections()
