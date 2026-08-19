@@ -29,6 +29,7 @@ Options:
 | `-q, --quiet` | no access log (HTTP mode only) | off |
 | `--access-log <path>` | append access log to `<path>`, `-` = stdout (HTTP mode only) | stderr |
 | `--allowed-hosts <list>` | extra `Host` names to accept, comma separated; `all` turns the check off (HTTP mode only) | loopback names, `*.localhost`, literal IPs, bind address |
+| `--secret <value>` | session signing key, set it yourself; env `ETA_SERVER_SECRET` (HTTP mode only) | random per-user key, mixed with the document root |
 | `--behind-proxy` | behind a reverse proxy: skip the Host check, trust `X-Forwarded-For/-Proto/-Host` (HTTP mode only) | off |
 | `-h, --help` | help | |
 
@@ -151,11 +152,12 @@ Only erasable syntax is allowed (type annotations / interface / type / generics 
 - `PATH_INFO`: requesting `hello.eta/foo/bar` renders `hello.eta` with `_SERVER.PATH_INFO = '/foo/bar'`.
 - Templates are re-read and re-compiled on every request — edit, refresh, done.
 - Errors in a script produce a 500 page with the escaped error and stack trace.
-- Request body cap: 64MB (413 beyond it). Path traversal, symlink/junction escapes and other filesystem tricks are all rejected with 404 — including win32 8.3 short-name aliases (`/NODE_M~1/…`), which resolve to their real long name before any rule runs.
+- Request body cap: 64MB (413 beyond it). Path traversal, symlink/junction escapes and other filesystem tricks are all rejected with 404 — including win32 8.3 short-name aliases (`/NODE_M~1/…`), which resolve to their real long name before any rule runs. Duplicate slashes and raw backslashes (`\` is the same as `/` in an http URL) normalize with a 308 before routing, so the path that gets served always matches the path that was requested.
 - **Host allowlist**: requests whose `Host` is not a loopback name, a `*.localhost` name, a literal IP or the bind address get a 403. This stops a remote page from reaching your dev server by pointing its own hostname at `127.0.0.1` (DNS rebinding). Serving a custom hostname on purpose? `--allowed-hosts myapp.test`, or `--allowed-hosts all` to switch the check off. Behind a reverse proxy use `--behind-proxy` instead — see [Production deployment](#production-deployment).
 - `X-Forwarded-For` / `-Proto` / `-Host` are **ignored** unless `--behind-proxy` says a proxy owns the port; a rebound page is same-origin and could otherwise forge its own client address.
 - Responses carry `Cache-Control: no-store` unless the script sets the header itself, so the browser can't hand back a stale copy of a file you just edited.
 - Sessions are signed cookies (HMAC-SHA256, key derived from a random per-user secret persisted in your home directory, mixed with the document root). `_SESSION = {}` (or `null` / `false`) clears the session. Data is tamper-proof but visible to the client — don't store secrets.
+- **Setting the session key yourself**: `--secret <value>` (or `ETA_SERVER_SECRET=<value>`, preferred where others can read your process list) replaces the automatic key *and* the per-root mixing, so the same value always derives the same key — reproducible in containers and CI with no writable home, and rotatable whenever you want. Instances sharing a secret accept each other's session cookies; instances with different keys do not. That last point matters if you run **two projects at once**: the cookie name (`etasess`) is fixed and cookies ignore the port number, so `localhost:5000` and `localhost:5001` compete for one cookie slot. A site never deletes a cookie it can't verify, so just browsing project B won't log you out of project A — but if both write sessions, each response overwrites the other's value. Give both the same `--secret` and they share one session instead of fighting over the slot.
 
 ## CLI render mode
 
@@ -205,6 +207,8 @@ npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 -q \
 > **Use `--behind-proxy`.** Both configurations below forward the client's `Host` unchanged (`ProxyPreserveHost On` / `proxy_set_header Host $host`), so your public domain arrives as the `Host` header — and the rebinding allowlist would reject it with a 403, because from the server's side a forwarded request and a rebound one are indistinguishable. The flag is how you declare the topology, and it pays for itself: it also makes eta-server *read* the `X-Forwarded-*` headers these configs already send, so `_SERVER.REMOTE_ADDR` becomes the real client instead of `127.0.0.1`, `_SERVER.REQUEST_SCHEME` reports `https` when the client used TLS, and access-log lines carry the client address rather than the proxy's.
 >
 > Keep the bind address private (`-H 127.0.0.1`, the default) when using it — the flag's contract is that only your proxy can reach the port, since anything that can connect directly may now forge its own address and scheme. Want both belt and braces? `--behind-proxy --allowed-hosts example.com,www.example.com` keeps the Host allowlist enforced on top.
+
+> **Pin the session key.** A service account often has no writable home directory, and the automatic key then falls back to a machine fingerprint — so set it explicitly with `ETA_SERVER_SECRET` in the supervisor environment (or `--secret`, which is readable in the process list). Sessions then survive restarts, redeploys and a move to another host, and rotating the value invalidates every session on purpose.
 
 ### Apache (reverse proxy)
 
@@ -260,6 +264,7 @@ Whichever proxy you use, keep eta-server itself alive with a process supervisor.
 [program:eta-server]
 command=/usr/bin/npx -y eta-server -r /srv/eta/www -p 5000 -H 127.0.0.1 --behind-proxy
 directory=/srv/eta/www
+environment=ETA_SERVER_SECRET="put-a-long-random-value-here"
 autostart=true
 autorestart=true
 stderr_logfile=/var/log/eta-server.err.log

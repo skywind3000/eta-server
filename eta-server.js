@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/19 23:30:00
+ * Last Modified: 2026/08/20 02:10:00
  *
  * ===================================================================== */
 'use strict'
@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.4.1'
+const VERSION = '0.4.2'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -251,7 +251,23 @@ function loadMasterSecret () {
 // secrets, so a session cookie from site A never verifies on site B
 // even when both run on this host (per-site isolation kept from the
 // fingerprint design)
-function deriveSecret (rootDir) {
+//
+// An explicit secret (--secret / ETA_SERVER_SECRET, decision #21)
+// replaces BOTH inputs: the persisted master secret AND the per-root
+// mixing. "I set the signing key myself" has to mean the same value
+// yields the same key everywhere, which is what makes the option
+// useful — a reproducible key in containers / CI with no writable
+// home, deliberate rotation, and the manual way out of the shared
+// cookie-name collision (two instances handed one secret verify each
+// other's cookies instead of clearing them; see known limitations).
+// The cost is deliberate, documented and printed at startup: per-site
+// isolation is off, so every root started with this secret shares one
+// session namespace
+function deriveSecret (rootDir, explicit) {
+  if (explicit) {
+    return crypto.createHmac('sha256', String(explicit))
+      .update('eta-server-session|explicit').digest('hex')
+  }
   let rootReal = ''
   try {
     // canonical form (decision #20): the plain realpath keeps whatever
@@ -930,8 +946,20 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   }
 
   const cookies = parseCookies(req.headers['cookie'])
-  const session = decodeSession(cookies[SESSION_COOKIE], ctx.secret) || {}
-  const hadSessionCookie = (SESSION_COOKIE in cookies)
+  // null-prototype even when there is no cookie at all: the restored
+  // path has been null-proto since decision #20, but the fresh path was
+  // a plain {}, which made _SESSION the one bridge dict whose prototype
+  // depended on whether the visitor already had a session (decision #22)
+  const decoded = decodeSession(cookies[SESSION_COOKIE], ctx.secret)
+  const session = decoded || Object.create(null)
+  // only a cookie we could VERIFY is ours to clear. The cookie name is
+  // a global constant and cookies are not port-scoped, so a second
+  // eta-server on another port receives the first one's cookie, fails
+  // the HMAC, and used to answer with the Max-Age=0 clearing line —
+  // i.e. opening site B logged you out of site A (decision #22). An
+  // unverifiable value is left alone; --secret (decision #21) is still
+  // how two roots are made to agree on one session
+  const hadSessionCookie = (decoded !== null)
 
   const resp = makeResp(opts.defaultStatus)
   const data = {
@@ -998,7 +1026,7 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
       // primitive is a mistake and gets warned about below. `false`
       // used to fall into that warning despite the docs listing it
       // as a clear (decision #20)
-      sessionOut = {}
+      sessionOut = Object.create(null)
     } else if (typeof data._SESSION === 'object') {
       sessionOut = data._SESSION            // {} / [] / new dict
     } else {
@@ -1056,8 +1084,30 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
 
   // ---- session cookie: re-sign (sliding) when session has data ----
   if (Object.keys(sessionOut).length > 0) {
-    const sessCookie = SESSION_COOKIE + '=' +
-      encodeSession(sessionOut, ctx.secret) + '; Path=/; HttpOnly; SameSite=Lax'
+    let sessCookie = ''
+    try {
+      sessCookie = SESSION_COOKIE + '=' + encodeSession(sessionOut, ctx.secret) +
+        '; Path=/; HttpOnly; SameSite=Lax'
+    } catch (err) {
+      // JSON.stringify throws on a BigInt, a circular structure or a
+      // toJSON() that throws. This was the last unguarded throw site
+      // after rendering, and therefore the fifth escape from the "a
+      // fallback page never turns a 404 into anything else" promise
+      // that decisions #18/#19/#20 closed for render exceptions,
+      // invalid statuses, oversized sessions and invalid headers
+      // (decision #22). The PRD requires JSON-serializable session
+      // values; name the constraint instead of leaking a framework
+      // stack that points nowhere near the offending template line
+      if (opts.plain404OnError) {
+        console.error('eta-server: fallback page stored a non-serializable ' +
+          '_SESSION value, degrading to the built-in 404: ' +
+          ((err && err.message) || err))
+        return sendError(res, 404, 'Not Found')
+      }
+      return sendError(res, 500, 'Internal Server Error',
+        '_SESSION values must be JSON-serializable: ' +
+        ((err && err.message) || err))
+    }
     if (Buffer.byteLength(sessCookie, 'utf8') > SESSION_COOKIE_LIMIT) {
       if (opts.plain404OnError) {
         // same fallback promise: degrade, never escalate (decision #18)
@@ -1255,8 +1305,23 @@ async function handleRequest (req, res, ctx) {
   // protocol-relative and misparse the host part) ----
   const rawUrl = req.url || ''
   const rawPath = rawUrl.split(/[?#]/)[0]
-  if (rawPath.indexOf('//') >= 0) {
-    const loc = rawPath.replace(/\/{2,}/g, '/') +
+  // '\' is EQUIVALENT to '/' in an http(s) URL per the WHATWG standard,
+  // which is what the new URL() call below implements and what browsers
+  // apply before they ever send the request. Two consequences, both
+  // reproduced (decision #22): '/\host/admin.eta' parsed as an
+  // authority, so the host part was silently dropped and the request
+  // served '/admin.eta' — the served path bearing no resemblance to the
+  // request target that a fronting proxy, an access rule or the access
+  // log sees; and the 308 below, splicing the raw target, answered
+  // '//\evil.example/x' with 'Location: /\evil.example/x', which the
+  // browser re-normalizes into '//evil.example/x' — an open redirect.
+  // Normalizing here makes the guard see exactly what the parser will,
+  // and the redirect target carries no backslash at all. A literal
+  // backslash in a filename stays reachable through %5C, which is
+  // decoded later and never passes through this guard (decision #12)
+  const rawNorm = rawPath.replace(/\\/g, '/')
+  if (rawNorm !== rawPath || rawNorm.indexOf('//') >= 0) {
+    const loc = rawNorm.replace(/\/{2,}/g, '/') +
       (rawUrl.length > rawPath.length ? rawUrl.slice(rawPath.length) : '')
     res.writeHead(308, { 'Location': loc })
     res.end()
@@ -1506,7 +1571,9 @@ async function renderCli (script, args) {
       argv: [script].concat(args),
     }),
     _COOKIE: Object.create(null),
-    _SESSION: {},
+    // null-prototype like every other bridge dict, and like the HTTP
+    // side on both the fresh and the restored path (decision #22)
+    _SESSION: Object.create(null),
     _BODY: Buffer.alloc(0),
     _JSON: null,
     RESP: resp,
@@ -1581,7 +1648,9 @@ function startServer (rootDir, port, host, options) {
     rootReal: realpathCanon(root),
     host: host,
     port: port,
-    secret: deriveSecret(root),
+    // options.secret (--secret / ETA_SERVER_SECRET) overrides the
+    // persisted key AND the per-root derivation (decision #21)
+    secret: deriveSecret(root, options.secret),
     eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
     accessLog: accessLog,
     allowedHosts: allowedHosts,
@@ -1601,6 +1670,16 @@ function startServer (rootDir, port, host, options) {
         '(--allowed-hosts all) — any web page the browser visits can now ' +
         'reach this server through a rebound DNS name and read the responses')
     }
+  }
+
+  // an explicit key silently drops the per-site isolation decision #13
+  // documents, so say it once at startup like every other flag that
+  // trades a default away (decision #21)
+  if (options.secret) {
+    console.error('eta-server: session key taken from --secret / ' +
+      'ETA_SERVER_SECRET — the per-root derivation is off, so every ' +
+      'document root started with this secret shares one session ' +
+      'namespace (sessions also survive across machines)')
   }
 
   // loopback binds are the intended usage; anything else deserves a
@@ -1677,6 +1756,11 @@ function printHelp () {
   console.log('                      separated (default: loopback names,')
   console.log('                      *.localhost, literal IPs and the bind')
   console.log('                      address); "all" disables the check')
+  console.log('  --secret <value>    session signing key, set it yourself')
+  console.log('                      instead of the automatic per-user /')
+  console.log('                      per-root key; instances sharing a secret')
+  console.log('                      accept each other\'s session cookies.')
+  console.log('                      Env: ETA_SERVER_SECRET (HTTP mode only)')
   console.log('  --behind-proxy      running behind a reverse proxy: skip the')
   console.log('                      Host check and take the client address /')
   console.log('                      scheme / host from X-Forwarded-For,')
@@ -1692,6 +1776,11 @@ function printHelp () {
 function parseArgs (argv) {
   const opts = { root: process.cwd(), port: 5000, host: '127.0.0.1',
     quiet: false, accessLog: null, allowedHosts: null, behindProxy: false,
+    // env channel for the same value, and the one to prefer: a command
+    // line is readable by every process on the box (ps / Task Manager)
+    // and lands in shell history, while the supervisor config in the
+    // README keeps it in a file on disk. --secret wins when both are set
+    secret: process.env.ETA_SERVER_SECRET || null,
     script: null, args: [] }
   const args = argv.slice(2)
   for (let i = 0; i < args.length; i++) {
@@ -1717,6 +1806,13 @@ function parseArgs (argv) {
     } else if (a === '--allowed-hosts') {
       if (i + 1 >= args.length) throw new Error('missing value for ' + a)
       opts.allowedHosts = args[++i]
+    } else if (a === '--secret') {
+      if (i + 1 >= args.length) throw new Error('missing value for ' + a)
+      const v = args[++i]
+      // a blank value would look configured and silently fall back to
+      // the automatic key — the one outcome nobody asked for
+      if (!v.trim()) throw new Error('empty value for ' + a)
+      opts.secret = v
     } else if (a === '--behind-proxy') {
       opts.behindProxy = true
     } else if (a === '-h' || a === '--help') {
@@ -1764,6 +1860,7 @@ if (require.main === module) {
     startServer(opts.root, opts.port, opts.host, {
       quiet: opts.quiet, accessLog: opts.accessLog,
       allowedHosts: opts.allowedHosts, behindProxy: opts.behindProxy,
+      secret: opts.secret,
     }).then((server) => {
       printBanner(path.resolve(opts.root), opts.port, opts.host)
       const shutdown = () => {

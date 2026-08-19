@@ -8,7 +8,7 @@
  * Requires Node 18+.
  *
  * Created by skywind on 2026/08/18
- * Last Modified: 2026/08/18 00:00:00
+ * Last Modified: 2026/08/20 02:10:00
  *
  * ===================================================================== */
 'use strict'
@@ -231,6 +231,24 @@ function main () {
     const r = run(['-'], '\ufeffBOM-STDIN')
     assert.strictEqual(r.code, 0)
     assert.strictEqual(r.out, 'BOM-STDIN')
+  })
+
+  check('--secret rejects a missing or blank value', () => {
+    // a blank secret would look configured while silently falling back
+    // to the automatic key (decision #21)
+    const r1 = run(['--secret'])
+    assert.strictEqual(r1.code, 1)
+    assert.ok(r1.err.indexOf('missing value for --secret') >= 0, r1.err)
+    const r2 = run(['--secret', '   '])
+    assert.strictEqual(r2.code, 1)
+    assert.ok(r2.err.indexOf('empty value for --secret') >= 0, r2.err)
+  })
+
+  check('--secret before a script is accepted and ignored (CLI mode)', () => {
+    writeTmp('sec.eta', 'SEC-OK')
+    const r = run(['--secret', 'abc', path.join(tmpdir, 'sec.eta')])
+    assert.strictEqual(r.code, 0)
+    assert.strictEqual(r.out, 'SEC-OK')
   })
 
   fs.rmSync(tmpdir, { recursive: true, force: true })

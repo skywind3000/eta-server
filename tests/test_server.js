@@ -7,7 +7,7 @@
  * Requires Node 18+ (global fetch).
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/20 01:00:00
+ * Last Modified: 2026/08/20 02:10:00
  *
  * ===================================================================== */
 'use strict'
@@ -632,6 +632,46 @@ async function main () {
       assert.strictEqual(res.headers.get('location'), '/sub/index.html')
     })
 
+    await check('backslash targets 308 instead of routing somewhere else',
+      async () => {
+        // '\' is '/' per WHATWG, so new URL() read '/\host/x.eta' as an
+        // AUTHORITY: the host part vanished and the request served
+        // '/x.eta' — a served path unrelated to the request target that
+        // a fronting proxy or an access rule sees. The 308 also spliced
+        // the raw target, answering '//\evil/x' with 'Location:
+        // /\evil/x', which browsers re-normalize into '//evil/x' — an
+        // open redirect (decision #22). Raw socket: every URL parser on
+        // the way (fetch included) normalizes the backslash away first
+        const BS = '\\'
+        writeDemo('t_bs.eta', 'BS-TARGET-SERVED')
+        const targets = [
+          '//' + BS + 'evil.example/x',
+          '/' + BS + '/evil.example/t_bs.eta',
+          '/' + BS + BS + 'evil.example/t_bs.eta',
+          '/' + BS + 't_bs.eta',
+          '/sub' + BS + 't_bs.eta',
+        ]
+        for (const target of targets) {
+          const out = await rawLine(PORT, 'GET ' + target + ' HTTP/1.1')
+          const first = out.split('\r\n')[0]
+          assert.ok(/^HTTP\/1\.1 308 /.test(first), target + ' -> ' + first)
+          const loc = out.split('\r\n')
+            .find((l) => /^location:/i.test(l)) || ''
+          assert.ok(loc.indexOf(BS) < 0,
+            'Location must carry no backslash: ' + loc)
+          assert.ok(!/location:\s*\/\//i.test(loc),
+            'Location must not be protocol-relative: ' + loc)
+          assert.ok(out.indexOf('BS-TARGET-SERVED') < 0,
+            target + ' served a page instead of redirecting')
+        }
+        // the %5C escape hatch still reaches a literal backslash name
+        // (decoded later, never through this guard — decision #12)
+        const enc = await fetch(BASE + '/t_bs%5Cnope.eta',
+          { redirect: 'manual' })
+        assert.strictEqual(enc.status, 404)
+        await enc.text()
+      })
+
     await check('8.3 short names cannot bypass the hidden-path convention',
       async () => {
         // fs.realpathSync resolves symlinks but not win32 short names,
@@ -879,6 +919,38 @@ async function main () {
       assert.ok(body.indexOf('4KB') >= 0)
     })
 
+    await check('non-serializable _SESSION gives a clear 500', async () => {
+      // JSON.stringify inside the session re-sign was the last
+      // unguarded throw site after rendering (decision #22)
+      writeDemo('t_sessnos.eta', '<% _SESSION.x = 10n %>ok')
+      const res = await fetch(BASE + '/t_sessnos.eta')
+      assert.strictEqual(res.status, 500)
+      const body = await res.text()
+      assert.ok(body.indexOf('JSON-serializable') >= 0, body.slice(0, 200))
+      // a circular structure takes the same path
+      writeDemo('t_sesscirc.eta',
+        '<% const o = {}; o.o = o; _SESSION.o = o %>ok')
+      const r2 = await fetch(BASE + '/t_sesscirc.eta')
+      assert.strictEqual(r2.status, 500)
+      assert.ok((await r2.text()).indexOf('JSON-serializable') >= 0)
+    })
+
+    await check('_SESSION is null-prototype on a fresh session too',
+      async () => {
+        // the restored path has been null-proto since decision #20, the
+        // fresh one (no cookie yet) was a plain {} (decision #22)
+        writeDemo('t_sessproto.eta',
+          '<%~ Object.getPrototypeOf(_SESSION) === null %>' +
+          '<% _SESSION.n = 1 %>')
+        const r1 = await fetch(BASE + '/t_sessproto.eta')
+        assert.strictEqual(await r1.text(), 'true', 'fresh session')
+        const c1 = getSessionCookie(r1)
+        assert.ok(c1)
+        const r2 = await fetch(BASE + '/t_sessproto.eta',
+          { headers: { Cookie: c1 } })
+        assert.strictEqual(await r2.text(), 'true', 'restored session')
+      })
+
     await check('deriveSecret mixes in the document root', async () => {
       const mod = require(SERVER)
       const a = mod.deriveSecret(ROOT)
@@ -888,6 +960,150 @@ async function main () {
       assert.notStrictEqual(a, b)
       assert.strictEqual(a, mod.deriveSecret(ROOT))
     })
+
+    await check('explicit --secret replaces the key and the root mixing',
+      async () => {
+        // decision #21: an explicit secret must produce the SAME key
+        // regardless of root, otherwise "I set the signing key" would
+        // still leave two instances unable to read each other's cookies
+        const mod = require(SERVER)
+        const a = mod.deriveSecret(ROOT, 'seed-one')
+        const b = mod.deriveSecret(path.join(ROOT, 'sub'), 'seed-one')
+        assert.strictEqual(a.length, 64)
+        assert.strictEqual(a, b, 'same secret must ignore the root')
+        assert.notStrictEqual(a, mod.deriveSecret(ROOT, 'seed-two'))
+        assert.notStrictEqual(a, mod.deriveSecret(ROOT))
+      })
+
+    await check('two roots sharing --secret accept each other\'s sessions',
+      async () => {
+        const mod = require(SERVER)
+        const tpl = '<% _SESSION.n = (_SESSION.n || 0) + 1 %><%~ _SESSION.n %>'
+        writeDemo('t_secret.eta', tpl)
+        writeDemo('sub/t_secret.eta', tpl)
+        // a page that does NOT touch the session: only there does the
+        // "empty session + incoming cookie" clearing branch run, so it
+        // is what discriminates "verified" from "rejected"
+        writeDemo('sub/t_plain.eta', 'plain')
+        const portS1 = PORT + 7
+        const portS2 = PORT + 8
+        const srv1 = await mod.startServer(ROOT, portS1, '127.0.0.1',
+          { quiet: true, secret: 'shared-seed' })
+        const srv2 = await mod.startServer(path.join(ROOT, 'sub'), portS2,
+          '127.0.0.1', { quiet: true, secret: 'shared-seed' })
+        try {
+          const r1 = await fetch('http://127.0.0.1:' + portS1 +
+            '/t_secret.eta')
+          assert.strictEqual(await r1.text(), '1')
+          const c1 = getSessionCookie(r1)
+          assert.ok(c1)
+          // the second instance verifies a cookie the first one minted,
+          // so counting continues instead of restarting
+          const r2 = await fetch('http://127.0.0.1:' + portS2 +
+            '/t_secret.eta', { headers: { Cookie: c1 } })
+          assert.strictEqual(await r2.text(), '2')
+          // and a session-less page on the other instance leaves the
+          // cookie alone instead of clearing it
+          const r3 = await fetch('http://127.0.0.1:' + portS2 +
+            '/t_plain.eta', { headers: { Cookie: c1 } })
+          assert.strictEqual(await r3.text(), 'plain')
+          const all = r3.headers.getSetCookie ? r3.headers.getSetCookie() : []
+          const cleared = all.filter((c) => c.startsWith('etasess=') &&
+            c.indexOf('Max-Age=0') >= 0)
+          assert.strictEqual(cleared.length, 0,
+            'a verifiable cookie must not be cleared')
+        } finally {
+          if (srv1.closeAllConnections) srv1.closeAllConnections()
+          if (srv2.closeAllConnections) srv2.closeAllConnections()
+          await new Promise(r => srv1.close(r))
+          await new Promise(r => srv2.close(r))
+        }
+      })
+
+    await check('without --secret two roots leave each other\'s cookie alone',
+      async () => {
+        // the cookie NAME is global and cookies are not port-scoped, so
+        // instance two receives a cookie it cannot verify — it used to
+        // answer with the Max-Age=0 clear, i.e. opening site B logged
+        // you out of site A. Only a verified cookie is ours to clear
+        // (decision #22); --secret is still how two roots are made to
+        // agree on one session (decision #21)
+        const mod = require(SERVER)
+        const tpl = '<% _SESSION.n = (_SESSION.n || 0) + 1 %><%~ _SESSION.n %>'
+        writeDemo('t_secret2.eta', tpl)
+        writeDemo('sub/t_plain2.eta', 'plain')
+        const portS3 = PORT + 9
+        const portS4 = PORT + 10
+        const srv3 = await mod.startServer(ROOT, portS3, '127.0.0.1',
+          { quiet: true })
+        const srv4 = await mod.startServer(path.join(ROOT, 'sub'), portS4,
+          '127.0.0.1', { quiet: true })
+        try {
+          const r1 = await fetch('http://127.0.0.1:' + portS3 +
+            '/t_secret2.eta')
+          assert.strictEqual(await r1.text(), '1')
+          const c1 = getSessionCookie(r1)
+          const r2 = await fetch('http://127.0.0.1:' + portS4 +
+            '/t_plain2.eta', { headers: { Cookie: c1 } })
+          assert.strictEqual(await r2.text(), 'plain')
+          const all = r2.headers.getSetCookie ? r2.headers.getSetCookie() : []
+          assert.strictEqual(all.length, 0,
+            'an unverifiable cookie must be left untouched, not cleared')
+          // and the first site's session is therefore still alive
+          const r3 = await fetch('http://127.0.0.1:' + portS3 +
+            '/t_secret2.eta', { headers: { Cookie: c1 } })
+          assert.strictEqual(await r3.text(), '2',
+            'site A lost its session after a request to site B')
+        } finally {
+          if (srv3.closeAllConnections) srv3.closeAllConnections()
+          if (srv4.closeAllConnections) srv4.closeAllConnections()
+          await new Promise(r => srv3.close(r))
+          await new Promise(r => srv4.close(r))
+        }
+      })
+
+    await check('ETA_SERVER_SECRET feeds the same key as --secret',
+      async () => {
+        // a child server takes the secret from the environment; an
+        // in-process instance on a DIFFERENT root passes the same value
+        // as an option — the cookie must cross over, which is only true
+        // if both channels reach the same derivation
+        const mod = require(SERVER)
+        const tpl = '<% _SESSION.n = (_SESSION.n || 0) + 1 %><%~ _SESSION.n %>'
+        writeDemo('t_secret3.eta', tpl)
+        writeDemo('sub/t_secret3.eta', tpl)
+        const portS5 = PORT + 11
+        const portS6 = PORT + 12
+        const childS = spawn(process.execPath,
+          [SERVER, '-r', ROOT, '-p', String(portS5), '--quiet'],
+          { stdio: ['ignore', 'pipe', 'pipe'],
+            env: Object.assign({}, process.env,
+              { ETA_SERVER_SECRET: 'env-seed' }) })
+        const srv6 = await mod.startServer(path.join(ROOT, 'sub'), portS6,
+          '127.0.0.1', { quiet: true, secret: 'env-seed' })
+        try {
+          let r1 = null
+          for (let i = 0; i < 50; i++) {
+            try {
+              r1 = await fetch('http://127.0.0.1:' + portS5 +
+                '/t_secret3.eta')
+              break
+            } catch (e) { await new Promise(r => setTimeout(r, 200)) }
+          }
+          assert.ok(r1, 'child server never came up')
+          assert.strictEqual(await r1.text(), '1')
+          const c1 = getSessionCookie(r1)
+          assert.ok(c1)
+          const r2 = await fetch('http://127.0.0.1:' + portS6 +
+            '/t_secret3.eta', { headers: { Cookie: c1 } })
+          assert.strictEqual(await r2.text(), '2',
+            'env secret and option secret derived different keys')
+        } finally {
+          childS.kill()
+          if (srv6.closeAllConnections) srv6.closeAllConnections()
+          await new Promise(r => srv6.close(r))
+        }
+      })
 
     await check('session cookie name monopoly (setcookie dropped)', async () => {
       writeDemo('t_sessmono.eta',
@@ -1121,6 +1337,7 @@ async function main () {
         '<% if (_GET.big) _SESSION.blob = "x".repeat(5000) %>' +
         '<% if (_GET.hdr) RESP.header("X Y", "v") %>' +
         '<% if (_GET.val) RESP.header("X-Y", "a\\nb: c") %>' +
+        '<% if (_GET.nos) _SESSION.bad = 10n %>' +
         'CUSTOM-404:<%~ _SERVER.REQUEST_URI %>' +
         ':qs=<%~ typeof _SERVER.QUERY_STRING %>')
       const res = await fetch(BASE + '/definitely-missing')
@@ -1144,8 +1361,9 @@ async function main () {
       assert.strictEqual(rg.status, 404)
       assert.ok((await rg.text()).indexOf('CUSTOM-404') < 0)
       // ...and invalid response headers (validated at RESP.header()
-      // record time, decision #19)
-      for (const q of ['hdr=1', 'val=1']) {
+      // record time, decision #19), and a session value that cannot be
+      // serialized at re-sign time (decision #22)
+      for (const q of ['hdr=1', 'val=1', 'nos=1']) {
         const rh = await fetch(BASE + '/definitely-missing?' + q)
         assert.strictEqual(rh.status, 404, q)
         assert.ok((await rh.text()).indexOf('CUSTOM-404') < 0, q)
