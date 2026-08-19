@@ -167,6 +167,20 @@ A second external review found six issues (three empirically reproduced); all fi
 
 Four design-level findings from the same review are documented as known limitations rather than fixed: session key strength, concurrent session lost updates, synchronous FS on the hot path, no Range/ETag static serving (see below).
 
+### Decision #16: access log (Common Log Format, `res.on('finish')` hook)
+
+HTTP mode writes one access-log line per completed request, in NCSA / Apache Common Log Format with an elapsed-time suffix:
+
+```
+127.0.0.1 - - [19/Aug/2026:10:23:45 +0800] "GET /hello.eta HTTP/1.1" 200 89 6ms
+```
+
+- **Single hook point**: the line is emitted from the response `finish` event, registered once in the `createServer` wrapper — covering every dispatcher branch (template / static / redirect / error) without touching them. Connections destroyed before completion are not logged;
+- **Byte count**: Node's `writeHead(code, headersObject)` headers are not visible to `getHeader()` afterwards, so the wrapper tracks `writeHead` calls and captures the `Content-Length` argument (the object-less 301 / 308 / 405 calls carry an empty body → 0);
+- **Destination**: stderr by default (stdout stays clean in every mode); `--access-log <file>` appends to a file (write errors reported once, never crash the server); `--access-log -` writes to stdout; `--quiet` silences the access log entirely (takes precedence over `--access-log`). Runtime warnings and crash-guard stacks keep going to stderr regardless;
+- **Format choice**: CLF keeps the log grep / awk / goaccess-compatible for PHP-ecosystem users; structured (JSON) output is not needed at the dev-server scale;
+- **State model**: the destination is a process-global immutable startup setting (`logConfig`), not per-request state — no conflict with decision #14. `startServer(root, port, host, options)` gained an optional fourth argument (`{ quiet, accessLog }`) so library users get the same controls; CLI mode ignores both flags (PHP-style leniency, same as `-r` / `-p` / `-H`).
+
 ## Bridge API list
 
 | Name | Type | Description |
@@ -192,7 +206,7 @@ Unified `errorPage(code, title, detail)`: monospace font + `<pre>` with escaped 
 - `tests/test_server.js`: spawns a child process running the server (port 5177, overridable via `ETA_TEST_PORT` for parallel CI), fetch-based assertions for HTTP mode;
 - `tests/test_cli.js`: spawnSync assertions for CLI render mode (decision #11): file rendering byte-exact, argv passthrough (argv[0]=script itself, args after the script that look like `-H` pass through verbatim), degraded `_SERVER` key set and empty bridge, no extension enforcement (.txt renders too), missing file / render exception exit 1 with clean stdout, include base = script directory, require anchored at the script directory, writeraw / json short-circuit, RESP response-control no-ops, BOM tolerated, trailing newline preserved, options before the script name accepted; stdin (`-`) rendering, three-key degradation (SCRIPT_NAME/FILENAME='-', SCRIPT_DIRNAME=cwd), argv[0]='-', include/require base = cwd, exceptions exit 1, BOM tolerated.
 
-HTTP mode has 46 assertions:
+HTTP mode has 49 assertions:
 
 - rendering: index.eta, `/` fallback, query params;
 - directories: 301 trailing slash, index.html fallback, **escaping index candidates 404 one by one (fail-closed even with a legitimate index.html beside)**;
@@ -205,7 +219,8 @@ HTTP mode has 46 assertions:
 - session: three-level chained cookie counting 1→2→3, tampered signature rejected (count resets to 1), **over 4KB → 500, deriveSecret root-mixing unit assertion, setcookie same-name exclusivity (not sent + exactly one framework entry)**, **non-numeric maxage omits Max-Age (no `Max-Age=NaN`, decision #15)**;
 - RESP: **status(9999) / status(0) / status('abc') → 500, RESP.escape equivalent to escape()**, **hop-by-hop headers dropped with a warning (Transfer-Encoding / Connection filtered, ordinary headers pass, decision #15)**;
 - require: demo page rendering, **required local files hot-reload on edit (mtime-driven cache invalidation, v1→v2 without restart, decision #15)**;
-- 500: broken.eta (calls an undefined function).
+- 500: broken.eta (calls an undefined function);
+- **access log (decision #16): CLF line for rendered pages on stderr, `--access-log <file>` appends to a file and stays out of stderr, `--quiet` produces no access lines at all**.
 
 How to run: `npm test` (the tests themselves need Node 18+ for global fetch; `engines.node >= 22.18` is required by the in-template `require(.ts)` type-stripping feature — npm only warns on engines in pure test scenarios, doesn't block; test_server.js and test_cli.js run in sequence).
 
@@ -221,7 +236,7 @@ The server is single-process single-threaded (Node's default model), but async I
 
 - No HTTPS (local-oriented; handle it with a reverse proxy);
 - No multipart parsing (`_FILES` is phase two; request bodies go into `_BODY` raw);
-- No config files / logs; session TTL hardcoded at 30 minutes, sliding mode only, cookie name fixed (configurable TTL / timeout mode / cookie name wait for the phase-two config file);
+- No config files; access log is built in (decision #16); session TTL hardcoded at 30 minutes, sliding mode only, cookie name fixed (configurable TTL / timeout mode / cookie name wait for the phase-two config file);
 - **No resource guardrails**: the 64MB body cap is per-request; no concurrent connection limit, total memory unbounded; no request-level timeout (a slow-body client can hold a connection forever) — acceptable for the local trusted-environment positioning; public deployments must have a reverse-proxy layer as the backstop;
 - 413 responses arrive only after the client finishes uploading (drain rather than disconnect on overrun, decision #14);
 - `_GET` / `_POST` / `_REQUEST` are plain objects; same-name parameters overwrite earlier values (no `getlist`-style multi-value access API);

@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/20 00:00:00
+ * Last Modified: 2026/08/20 01:00:00
  *
  * ===================================================================== */
 'use strict'
@@ -26,7 +26,7 @@ const os = require('node:os')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.1.3'
+const VERSION = '0.2.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
@@ -295,6 +295,86 @@ function parseForm (buf) {
     out[pair[0]] = pair[1]
   }
   return out
+}
+
+/* ---------------------------------------------------------------------
+ * access log (decision #16)
+ * ------------------------------------------------------------------- */
+
+// HTTP-mode access log, one Common Log Format line per completed
+// request, written from the response 'finish' event (single hook that
+// covers every dispatcher branch — template, static, redirect, error).
+// Destination defaults to stderr (stdout stays clean in every mode,
+// including piping); --access-log <file> appends to a file; --quiet
+// silences it. Process-global by design: this is immutable startup
+// configuration, not per-request state (decision #14).
+const LOG_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+const logConfig = {
+  access: process.stderr,   // writable stream, or null when --quiet
+}
+
+function pad2 (n) {
+  return n < 10 ? '0' + n : String(n)
+}
+
+// Apache / NCSA timestamp: [19/Aug/2026:10:23:45 +0800]
+function formatCltTime (d) {
+  const off = -d.getTimezoneOffset()
+  const sign = off < 0 ? '-' : '+'
+  const abs = Math.abs(off)
+  return pad2(d.getDate()) + '/' + LOG_MONTHS[d.getMonth()] + '/' +
+    d.getFullYear() + ':' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) +
+    ':' + pad2(d.getSeconds()) + ' ' + sign +
+    pad2(Math.floor(abs / 60)) + pad2(abs % 60)
+}
+
+// Content-Length cannot be read back from res after
+// writeHead(code, headersObject): getHeader() only sees headers set
+// through the setHeader() API. So the finish hook below captures it
+// here, when writeHead is called — every response branch goes through
+// writeHead, and the few object-less calls (301 / 308 / 405) carry an
+// empty body, hence the 0 default
+function responseBytes (state) {
+  return state.bytes
+}
+
+function trackWriteHead (res, state) {
+  const orig = res.writeHead
+  res.writeHead = function (...args) {
+    for (const a of args) {
+      if (a && typeof a === 'object' && !Array.isArray(a)) {
+        for (const k of Object.keys(a)) {
+          if (k.toLowerCase() === 'content-length') {
+            state.bytes = Number(a[k]) || 0
+          }
+        }
+      }
+    }
+    return orig.apply(res, args)
+  }
+}
+
+function accessLine (req, res, state, start) {
+  const remote = (req.socket && req.socket.remoteAddress) || '-'
+  const ms = Date.now() - start
+  return remote + ' - - [' + formatCltTime(new Date(start)) + '] "' +
+    req.method + ' ' + req.url + ' HTTP/' + req.httpVersion + '" ' +
+    res.statusCode + ' ' + responseBytes(state) + ' ' + ms + 'ms'
+}
+
+// open the --access-log destination: '-' means stdout, anything else
+// is a file opened in append mode (write errors are reported once,
+// never crash the server)
+function openAccessLog (spec) {
+  if (spec === '-') return process.stdout
+  if (!spec) return process.stderr
+  const stream = fs.createWriteStream(spec, { flags: 'a' })
+  stream.once('error', (err) => {
+    console.error('eta-server: access log write error: ' + err.message)
+  })
+  return stream
 }
 
 /* ---------------------------------------------------------------------
@@ -916,13 +996,14 @@ async function renderCli (script, args) {
  * server bootstrap
  * ------------------------------------------------------------------- */
 
-function startServer (rootDir, port, host) {
+function startServer (rootDir, port, host, options) {
   const root = path.resolve(rootDir)
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
     return Promise.reject(new Error('document root not found: ' + root))
   }
   port = Number(port) || 5000
   host = host || '127.0.0.1'
+  options = options || {}
 
   const ctx = {
     root: root,
@@ -933,7 +1014,20 @@ function startServer (rootDir, port, host) {
     eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
   }
 
+  // --quiet takes precedence over an explicit access-log destination
+  logConfig.access = options.quiet ? null
+    : openAccessLog(options.accessLog)
+
   const server = http.createServer((req, res) => {
+    const start = Date.now()
+    const state = { bytes: 0 }
+    trackWriteHead(res, state)
+    // 'finish' covers every dispatcher branch without touching them;
+    // aborted connections (destroyed before completion) are not logged
+    res.on('finish', () => {
+      const stream = logConfig.access
+      if (stream) stream.write(accessLine(req, res, state, start) + '\n')
+    })
     handleRequest(req, res, ctx).catch((err) => {
       sendError(res, 500, 'Internal Server Error', String(err && err.stack || err))
     })
@@ -977,6 +1071,9 @@ function printHelp () {
   console.log('  -r, --root <dir>    document root (default: cwd, HTTP mode only)')
   console.log('  -p, --port <port>   listen port (default: 5000, HTTP mode only)')
   console.log('  -H, --host <host>   bind address (default: 127.0.0.1, HTTP mode only)')
+  console.log('  -q, --quiet         no access log (HTTP mode only)')
+  console.log('  --access-log <p>    write the access log to <p>, appending;')
+  console.log('                      "-" means stdout (default: stderr)')
   console.log('  -h, --help          show this help')
   console.log('')
   console.log('CLI mode:')
@@ -987,6 +1084,7 @@ function printHelp () {
 
 function parseArgs (argv) {
   const opts = { root: process.cwd(), port: 5000, host: '127.0.0.1',
+    quiet: false, accessLog: null,
     script: null, args: [] }
   const args = argv.slice(2)
   for (let i = 0; i < args.length; i++) {
@@ -1004,6 +1102,11 @@ function parseArgs (argv) {
     } else if (a === '-H' || a === '--host') {
       if (i + 1 >= args.length) throw new Error('missing value for ' + a)
       opts.host = args[++i]
+    } else if (a === '-q' || a === '--quiet') {
+      opts.quiet = true
+    } else if (a === '--access-log') {
+      if (i + 1 >= args.length) throw new Error('missing value for ' + a)
+      opts.accessLog = args[++i]
     } else if (a === '-h' || a === '--help') {
       printHelp()
       process.exit(0)
@@ -1046,7 +1149,9 @@ if (require.main === module) {
       console.error('eta-server: unhandled rejection (server kept alive):')
       console.error((reason && reason.stack) ? reason.stack : String(reason))
     })
-    startServer(opts.root, opts.port, opts.host).then((server) => {
+    startServer(opts.root, opts.port, opts.host, {
+      quiet: opts.quiet, accessLog: opts.accessLog,
+    }).then((server) => {
       printBanner(path.resolve(opts.root), opts.port, opts.host)
       const shutdown = () => {
         server.close(() => process.exit(0))

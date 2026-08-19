@@ -68,7 +68,7 @@ Variables/functions exposed by the Node side to .eta templates, named and semant
 ### Not implemented (phase two)
 
 - `_FILES` — file uploads (multipart parsing);
-- Configuration files (ini / json) and log files;
+- Configuration files (ini / json);
 - CLI arguments for absolute timeouts / custom session TTL.
 
 ## CLI
@@ -82,9 +82,19 @@ eta-server [options] - [args...]                   # read the script from stdin
 - `-r / --root`: document root, defaults to the current directory (HTTP mode only);
 - `-p / --port`: port, defaults to 5000 (HTTP mode only);
 - `-H / --host`: listen address, defaults to 127.0.0.1 (HTTP mode only);
+- `-q / --quiet`: no access log (HTTP mode only);
+- `--access-log <path>`: append the access log to `<path>` instead of stderr; `-` means stdout (HTTP mode only);
 - `-h / --help`: help.
 
 On startup a banner is printed (version, root absolute path, access URL); port conflicts (EADDRINUSE) produce a friendly error.
+
+Every completed request gets one access-log line in Common Log Format (plus elapsed milliseconds), written on the response `finish` event:
+
+```
+127.0.0.1 - - [19/Aug/2026:10:23:45 +0800] "GET /hello.eta HTTP/1.1" 200 89 6ms
+```
+
+Default destination is stderr (stdout stays clean); aborted connections are not logged.
 
 ### CLI render mode
 

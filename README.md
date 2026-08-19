@@ -26,6 +26,8 @@ Options:
 | `-r, --root <dir>` | document root (HTTP mode only) | current directory |
 | `-p, --port <port>` | port (HTTP mode only) | 5000 |
 | `-H, --host <addr>` | bind address (HTTP mode only) | 127.0.0.1 |
+| `-q, --quiet` | no access log (HTTP mode only) | off |
+| `--access-log <path>` | append access log to `<path>`, `-` = stdout (HTTP mode only) | stderr |
 | `-h, --help` | help | |
 
 With no positional argument it starts the HTTP server; with one, it renders that script once to stdout (CLI mode, below).

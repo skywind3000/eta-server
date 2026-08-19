@@ -7,7 +7,7 @@
  * Requires Node 18+ (global fetch).
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/19 00:00:00
+ * Last Modified: 2026/08/20 01:00:00
  *
  * ===================================================================== */
 'use strict'
@@ -639,6 +639,70 @@ async function main () {
           }))
       }
       await Promise.all(jobs)
+    })
+
+    await check('access log line appears on stderr (CLF)', async () => {
+      const res = await fetch(BASE + '/hello.eta')
+      await res.text()
+      await new Promise(r => setTimeout(r, 100))
+      const re = /127\.0\.0\.1 - - \[[^\]]+\] "GET \/hello\.eta HTTP\/1\.1" 200 \d+ \d+ms/
+      assert.ok(re.test(stderr), 'stderr missing CLF line for /hello.eta')
+      // earlier requests were logged too (finish hook covers all branches)
+      assert.ok(/"GET \/index\.eta HTTP\/1\.1" 200 /.test(stderr),
+        'stderr missing CLF line for /index.eta')
+    })
+
+    await check('access log honors --access-log <file> (append)', async () => {
+      const port3 = PORT + 2
+      const BASE3 = 'http://127.0.0.1:' + port3
+      const logFile = path.join(os.tmpdir(),
+        'eta-test-access-' + Date.now() + '.log')
+      const child3 = spawn(process.execPath,
+        [SERVER, '-r', ROOT, '-p', String(port3), '--access-log', logFile],
+        { stdio: ['ignore', 'pipe', 'pipe'] })
+      let err3 = ''
+      child3.stderr.on('data', (c) => { err3 += c.toString() })
+      try {
+        for (let i = 0; i < 50; i++) {
+          try { await (await fetch(BASE3 + '/hello.eta')).text(); break }
+          catch (e) { await new Promise(r => setTimeout(r, 200)) }
+        }
+        await new Promise(r => setTimeout(r, 150))
+        const text = fs.readFileSync(logFile, 'utf8')
+        assert.ok(/"GET \/hello\.eta HTTP\/1\.1" 200 \d+ \d+ms/.test(text),
+          'access log file missing CLF line')
+        // file destination diverts the log away from stderr
+        assert.ok(!/"GET \/hello\.eta /.test(err3),
+          'access log leaked to stderr despite --access-log')
+      } finally {
+        child3.kill()
+        try { fs.rmSync(logFile) } catch (e) { }
+      }
+    })
+
+    await check('--quiet silences the access log', async () => {
+      const port4 = PORT + 3
+      const BASE4 = 'http://127.0.0.1:' + port4
+      const child4 = spawn(process.execPath,
+        [SERVER, '-r', ROOT, '-p', String(port4), '--quiet'],
+        { stdio: ['ignore', 'pipe', 'pipe'] })
+      let out4 = ''
+      let err4 = ''
+      child4.stdout.on('data', (c) => { out4 += c.toString() })
+      child4.stderr.on('data', (c) => { err4 += c.toString() })
+      try {
+        for (let i = 0; i < 50; i++) {
+          try { await (await fetch(BASE4 + '/hello.eta')).text(); break }
+          catch (e) { await new Promise(r => setTimeout(r, 200)) }
+        }
+        await new Promise(r => setTimeout(r, 150))
+        assert.ok(!/" \d{3} \d+ \d+ms/.test(err4),
+          'access log line found despite --quiet')
+        assert.ok(!/" \d{3} \d+ \d+ms/.test(out4),
+          'access log line found on stdout despite --quiet')
+      } finally {
+        child4.kill()
+      }
     })
   } finally {
     for (const f of tmpDemoFiles) {
