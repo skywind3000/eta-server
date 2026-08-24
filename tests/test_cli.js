@@ -251,6 +251,19 @@ function main () {
     assert.strictEqual(r.out, 'SEC-OK')
   })
 
+  check('--session-ttl validates its value', () => {
+    // invalid values are rejected up front, never a silent fallback to
+    // the 30-minute default (decision #24)
+    const r1 = run(['--session-ttl', 'abc'])
+    assert.strictEqual(r1.code, 1)
+    assert.ok(r1.err.indexOf('invalid session TTL') >= 0, r1.err)
+    const r2 = run(['--session-ttl', '0'])
+    assert.strictEqual(r2.code, 1)
+    const r3 = run(['--session-ttl'])
+    assert.strictEqual(r3.code, 1)
+    assert.ok(r3.err.indexOf('missing value for --session-ttl') >= 0, r3.err)
+  })
+
   fs.rmSync(tmpdir, { recursive: true, force: true })
 
   console.log('\n%d passed, %d failed', passed, failed)

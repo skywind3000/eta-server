@@ -494,6 +494,42 @@ async function main () {
           '_SESSION = false must emit the Max-Age=0 clear')
       })
 
+    await check('session TTL is configurable (options.sessionTtl)',
+      async () => {
+        // decision #24: the sliding timeout is a startup parameter;
+        // 0.02 minutes = 1.2 seconds — short enough to expire inside
+        // the test, long enough that normal processing does not race it
+        const mod = require(SERVER)
+        writeDemo('t_ttl.eta',
+          '<% _SESSION.n = (_SESSION.n || 0) + 1 %><%~ _SESSION.n %>')
+        const portT = PORT + 13
+        const srv = await mod.startServer(ROOT, portT, '127.0.0.1',
+          { quiet: true, sessionTtl: 0.02 })
+        try {
+          const base = 'http://127.0.0.1:' + portT + '/t_ttl.eta'
+          const r1 = await fetch(base)
+          assert.strictEqual(await r1.text(), '1')
+          const c1 = getSessionCookie(r1)
+          assert.ok(c1)
+          await new Promise(r => setTimeout(r, 1400))
+          const r2 = await fetch(base, { headers: { Cookie: c1 } })
+          assert.strictEqual(await r2.text(), '1',
+            'expired cookie must restart the session count')
+        } finally {
+          if (srv.closeAllConnections) srv.closeAllConnections()
+          await new Promise(r => srv.close(r))
+        }
+      })
+
+    await check('invalid sessionTtl rejects startServer', async () => {
+      // no silent fallback to the 30-minute default (decision #24)
+      const mod = require(SERVER)
+      await assert.rejects(
+        mod.startServer(ROOT, PORT + 14, '127.0.0.1',
+          { quiet: true, sessionTtl: 'abc' }),
+        /invalid session TTL/)
+    })
+
     await check('require() demo works (node:path)', async () => {
       const res = await fetch(BASE + '/require.eta')
       assert.strictEqual(res.status, 200)

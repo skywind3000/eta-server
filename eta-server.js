@@ -27,10 +27,10 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.4.3'
+const VERSION = '0.5.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
-const SESSION_TTL = 30 * 60 * 1000          // sliding timeout: 30 min
+const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
 // cookie capacity guard: an oversized session
 // cookie is silently dropped by browsers anyway; fail loudly instead
 const SESSION_COOKIE_LIMIT = 4096
@@ -291,8 +291,8 @@ function signPayload (secret, data) {
   return crypto.createHmac('sha256', secret).update(data).digest('base64url')
 }
 
-function encodeSession (data, secret) {
-  const payload = JSON.stringify({ d: data, e: Date.now() + SESSION_TTL })
+function encodeSession (data, secret, ttl) {
+  const payload = JSON.stringify({ d: data, e: Date.now() + (ttl || SESSION_TTL) })
   const b64 = Buffer.from(payload, 'utf8').toString('base64url')
   return b64 + '.' + signPayload(secret, b64)
 }
@@ -1148,7 +1148,8 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   if (Object.keys(sessionOut).length > 0) {
     let sessCookie = ''
     try {
-      sessCookie = SESSION_COOKIE + '=' + encodeSession(sessionOut, ctx.secret) +
+      sessCookie = SESSION_COOKIE + '=' +
+        encodeSession(sessionOut, ctx.secret, ctx.sessionTtl) +
         cookieAttrs
     } catch (err) {
       // JSON.stringify throws on a BigInt, a circular structure or a
@@ -1701,6 +1702,21 @@ function startServer (rootDir, port, host, options) {
   const allowedHosts = (behindProxy && !options.allowedHosts)
     ? null : buildAllowedHosts(host, options.allowedHosts)
 
+  // sliding session timeout, in minutes (--session-ttl /
+  // options.sessionTtl, decision #24); absent = the built-in 30
+  // minutes. Rejected up front like a bad document root: a silent
+  // fallback to the default would make "configured" TTLs expire on
+  // the wrong schedule with no diagnostic anywhere
+  let sessionTtl = SESSION_TTL
+  if (options.sessionTtl != null) {
+    const m = Number(options.sessionTtl)
+    if (!Number.isFinite(m) || m <= 0) {
+      return Promise.reject(new Error('invalid session TTL "' +
+        options.sessionTtl + '" (must be a positive number of minutes)'))
+    }
+    sessionTtl = Math.max(1, Math.round(m * 60 * 1000))
+  }
+
   const ctx = {
     root: root,
     // canonical: containment and the hidden-path rule compare relative
@@ -1712,6 +1728,7 @@ function startServer (rootDir, port, host, options) {
     // options.secret (--secret / ETA_SERVER_SECRET) overrides the
     // persisted key AND the per-root derivation (decision #21)
     secret: deriveSecret(root, options.secret),
+    sessionTtl: sessionTtl,
     eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
     accessLog: accessLog,
     allowedHosts: allowedHosts,
@@ -1822,6 +1839,8 @@ function printHelp () {
   console.log('                      per-root key; instances sharing a secret')
   console.log('                      accept each other\'s session cookies.')
   console.log('                      Env: ETA_SERVER_SECRET (HTTP mode only)')
+  console.log('  --session-ttl <m>   sliding session timeout in minutes')
+  console.log('                      (default: 30, HTTP mode only)')
   console.log('  --behind-proxy      running behind a reverse proxy: skip the')
   console.log('                      Host check and take the client address /')
   console.log('                      scheme / host from X-Forwarded-For,')
@@ -1842,6 +1861,7 @@ function parseArgs (argv) {
     // and lands in shell history, while the supervisor config in the
     // README keeps it in a file on disk. --secret wins when both are set
     secret: process.env.ETA_SERVER_SECRET || null,
+    sessionTtl: null,
     script: null, args: [] }
   const args = argv.slice(2)
   for (let i = 0; i < args.length; i++) {
@@ -1874,6 +1894,13 @@ function parseArgs (argv) {
       // the automatic key — the one outcome nobody asked for
       if (!v.trim()) throw new Error('empty value for ' + a)
       opts.secret = v
+    } else if (a === '--session-ttl') {
+      if (i + 1 >= args.length) throw new Error('missing value for ' + a)
+      const m = Number(args[++i])
+      if (!Number.isFinite(m) || m <= 0) {
+        throw new Error('invalid session TTL (must be a positive number of minutes)')
+      }
+      opts.sessionTtl = m
     } else if (a === '--behind-proxy') {
       opts.behindProxy = true
     } else if (a === '-h' || a === '--help') {
@@ -1922,6 +1949,7 @@ if (require.main === module) {
       quiet: opts.quiet, accessLog: opts.accessLog,
       allowedHosts: opts.allowedHosts, behindProxy: opts.behindProxy,
       secret: opts.secret,
+      sessionTtl: opts.sessionTtl,
     }).then((server) => {
       printBanner(path.resolve(opts.root), opts.port, opts.host)
       const shutdown = () => {
