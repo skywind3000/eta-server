@@ -1654,26 +1654,33 @@ async function handleRequest (req, res, ctx) {
   }
   // ---- slash merging: //a///b -> 308 /a/b (checked on the raw URL
   // first, because new URL() would treat a leading '//' as
-  // protocol-relative and misparse the host part) ----
+  // protocol-relative and misparse the host part). An absolute-form
+  // request target (e.g. GET http://host/path HTTP/1.1) is split into
+  // its scheme://authority prefix and path, so only the path is
+  // normalized and the protocol's own '//' is never merged. ----
   const rawUrl = req.url || ''
   const rawPath = rawUrl.split(/[?#]/)[0]
-  // '\' is EQUIVALENT to '/' in an http(s) URL per the WHATWG standard,
+  // '\\' is EQUIVALENT to '/' in an http(s) URL per the WHATWG standard,
   // which is what the new URL() call below implements and what browsers
   // apply before they ever send the request. Two consequences, both
-  // reproduced (decision #22): '/\host/admin.eta' parsed as an
+  // reproduced (decision #22): '/\\host/admin.eta' parsed as an
   // authority, so the host part was silently dropped and the request
   // served '/admin.eta' — the served path bearing no resemblance to the
   // request target that a fronting proxy, an access rule or the access
   // log sees; and the 308 below, splicing the raw target, answered
-  // '//\evil.example/x' with 'Location: /\evil.example/x', which the
+  // '//\\evil.example/x' with 'Location: /\\evil.example/x', which the
   // browser re-normalizes into '//evil.example/x' — an open redirect.
   // Normalizing here makes the guard see exactly what the parser will,
   // and the redirect target carries no backslash at all. A literal
   // backslash in a filename stays reachable through %5C, which is
   // decoded later and never passes through this guard (decision #12)
-  const rawNorm = rawPath.replace(/\\/g, '/')
-  if (rawNorm !== rawPath || rawNorm.indexOf('//') >= 0) {
-    const loc = rawNorm.replace(/\/{2,}/g, '/') +
+  const ABSOLUTE_FORM_RE = /^([a-z][a-z0-9+.-]*:\/\/[^/]*)/i
+  const absMatch = ABSOLUTE_FORM_RE.exec(rawPath)
+  const absPrefix = absMatch ? absMatch[1] : ''
+  const pathForCheck = absPrefix ? rawPath.slice(absPrefix.length) : rawPath
+  const pathNorm = pathForCheck.replace(/\\/g, '/')
+  if (pathNorm !== pathForCheck || pathNorm.indexOf('//') >= 0) {
+    const loc = absPrefix + pathNorm.replace(/\/{2,}/g, '/') +
       (rawUrl.length > rawPath.length ? rawUrl.slice(rawPath.length) : '')
     res.writeHead(308, { 'Location': loc })
     res.end()
