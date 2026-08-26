@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.5.1'
+const VERSION = '0.5.2'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
