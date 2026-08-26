@@ -264,6 +264,16 @@ function main () {
     assert.ok(r3.err.indexOf('missing value for --session-ttl') >= 0, r3.err)
   })
 
+  check('RESP.info() renders plain text in CLI mode', () => {
+    const r = run([path.join(__dirname, '..', 'demo', 'etainfo.eta')])
+    assert.strictEqual(r.code, 0)
+    assert.ok(r.out.indexOf('[System]') >= 0)
+    assert.ok(r.out.indexOf('eta-server Version =>') >= 0)
+    assert.ok(r.out.indexOf('[This Request (_SERVER)]') >= 0)
+    assert.ok(r.out.indexOf('REQUEST_METHOD => GET') >= 0)
+    assert.ok(r.out.indexOf('<!DOCTYPE') < 0, 'CLI output must not be HTML')
+  })
+
   fs.rmSync(tmpdir, { recursive: true, force: true })
 
   console.log('\n%d passed, %d failed', passed, failed)

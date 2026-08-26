@@ -65,6 +65,7 @@ Variables/functions exposed by the Node side to .eta templates, named and semant
 - `RESP.json(data)` — convenience JSON response (sets Content-Type and serializes automatically; **does not stop** rendering — the script must terminate subsequent output itself);
 - `RESP.setcookie(name, value, opts)` — set a cookie, values percent-encoded by default; non-numeric `maxage` is ignored (never emits `Max-Age=NaN`); **entries colliding with the session cookie name (`etasess`) are dropped and never sent** (the session mechanism owns that name; a warning goes to stderr);
 - `RESP.writeraw(buf)` — binary output channel: appends bytes; once used it short-circuits all text output (template text and interpolation are discarded entirely); writeraw does not set Content-Type — do it yourself with `RESP.header()`;
+- `RESP.info()` — generate a phpinfo()-style report of the runtime, the current request and the bridge API; returns HTML in HTTP mode and plain "key => value" text in CLI render mode, so `<%~ RESP.info() %>` is all a template needs for a diagnostic page;
 - Default Content-Type: `text/html; charset=utf-8` when the script sets none explicitly; default `Cache-Control: no-store`, likewise only when the script sets none.
 
 ### Not implemented (phase two)

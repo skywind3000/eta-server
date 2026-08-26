@@ -754,6 +754,281 @@ function gateReal (req, rootReal, abs) {
 }
 
 /* ---------------------------------------------------------------------
+ * RESP.info() — phpinfo()-style diagnostic page
+ * ------------------------------------------------------------------- */
+
+// mask env vars whose names look sensitive, same heuristic as the demo
+const INFO_SECRET_NAME_RE =
+  /SECRET|TOKEN|PASS(WORD|WD)?|CREDENTIAL|PRIVATE|SESSION_KEY|AUTH|(^|_)KEY(_|$)|API_?KEY/i
+
+function infoSortedEntries (obj) {
+  return Object.keys(obj).sort().map(k => [k, obj[k]])
+}
+
+function infoNowString () {
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  return now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' +
+    pad(now.getDate()) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) +
+    ':' + pad(now.getSeconds())
+}
+
+// eta's exports field does not expose ./package.json, so climb from
+// require.resolve('eta') to the package root by hand.
+function infoPkgVersion (name) {
+  let dir = path.dirname(require.resolve(name))
+  while (true) {
+    const f = path.join(dir, 'package.json')
+    if (fs.existsSync(f)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(f, 'utf8'))
+        if (pkg.name === name) return pkg.version || '?'
+      } catch (e) { /* keep climbing */ }
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) return '?'
+    dir = parent
+  }
+}
+
+let _cachedEtaVersion = null
+function infoEtaVersion () {
+  if (_cachedEtaVersion == null) {
+    _cachedEtaVersion = infoPkgVersion('eta')
+  }
+  return _cachedEtaVersion
+}
+
+function infoMaskedEnv () {
+  return infoSortedEntries(process.env).map(
+    (p) => INFO_SECRET_NAME_RE.test(p[0]) ? [p[0], '(masked by RESP.info)'] : p)
+}
+
+function infoModuleSearchPaths (scriptDirname) {
+  const out = []
+  let dir = scriptDirname || process.cwd()
+  while (true) {
+    out.push(path.join(dir, 'node_modules'))
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return out.join('\n')
+}
+
+function infoSections (bridge) {
+  const server = bridge._SERVER || Object.create(null)
+  const config = bridge._infoConfig || null
+  const mu = process.memoryUsage()
+  const nowStr = infoNowString()
+
+  const sections = []
+
+  sections.push({
+    title: 'System',
+    pairs: [
+        ['eta-server Version', VERSION],
+        ['Node.js Version', process.version],
+        ['Node.js Executable', process.execPath],
+        ['Platform', os.platform() + ' ' + os.release()],
+        ['OS / Architecture', os.type() + ' / ' + os.arch()],
+        ['Hostname', os.hostname()],
+        ['Process ID', String(process.pid)],
+        ['Current Working Directory', process.cwd()],
+        ['Memory (RSS / Heap Used)',
+          (mu.rss / 1048576).toFixed(1) + ' MB / ' +
+          (mu.heapUsed / 1048576).toFixed(1) + ' MB'],
+        ['Server Time', nowStr],
+      ]
+    })
+
+  sections.push({
+    title: 'Frameworks & Dependencies',
+      pairs: [
+        ['Eta', infoEtaVersion()],
+        ['Node.js', process.version],
+      ]
+    })
+
+  sections.push({ title: 'This Request (_SERVER)', pairs: infoSortedEntries(server) })
+  sections.push({
+    title: 'Request Parameters',
+      subTables: [
+        { header: '_GET', pairs: infoSortedEntries(bridge._GET || Object.create(null)) },
+        { header: '_POST', pairs: infoSortedEntries(bridge._POST || Object.create(null)) },
+        { header: '_REQUEST (GET + POST)', pairs: infoSortedEntries(bridge._REQUEST || Object.create(null)) },
+        { header: '_COOKIE', pairs: infoSortedEntries(bridge._COOKIE || Object.create(null)) },
+      ]
+    })
+
+  sections.push({ title: 'Session (_SESSION)', pairs: infoSortedEntries(bridge._SESSION || Object.create(null)) })
+  sections.push({
+    title: 'Environment Variables (process.env)',
+      note: 'Names that look like secrets are masked — see the RESP.info() implementation.',
+      pairs: infoMaskedEnv()
+    })
+
+  sections.push({
+    title: 'Paths',
+      pairs: [
+        ['DOCUMENT_ROOT', server.DOCUMENT_ROOT || '-'],
+        ['SCRIPT_FILENAME', server.SCRIPT_FILENAME || '-'],
+        ['SCRIPT_DIRNAME', server.SCRIPT_DIRNAME || '-'],
+        ['require() search path (node_modules)', infoModuleSearchPaths(server.SCRIPT_DIRNAME)],
+      ]
+    })
+
+  sections.push({
+    title: 'Bridge API (injected names)',
+      pairs: [
+        ['template text / <%= %> / <%~ %>', 'output channels: plain text passes through; <%= %> interpolates with HTML escaping; <%~ %> interpolates raw'],
+        ['escape(value)', 'PHP htmlspecialchars equivalent: String() first, then escapes & < > " \', returns the escaped string'],
+        ['RESP.header(name, value)', 'set a response header (Set-Cookie appends, others overwrite; output is buffered throughout rendering, no headers-already-sent limitation)'],
+        ['RESP.status(code)', 'set the response status code'],
+        ['RESP.redirect(url, code=302)', 'convenience redirect (does not stop rendering; the script returns itself)'],
+        ['RESP.json(data)', 'JSON response (Content-Type: application/json; does not stop rendering, pair it with a top-level return)'],
+        ['RESP.setcookie(name, value, opts)', 'set a cookie (values percent-encoded by default, matches PHP setcookie)'],
+        ['RESP.writeraw(buf)', 'binary output channel: accepts bytes only; once used it short-circuits all text output; set Content-Type yourself via RESP.header'],
+        ['RESP.info()', 'print a phpinfo()-style report of the server, request and runtime environment (HTML in HTTP mode, plain text in CLI mode)'],
+        ['require(spec)', 'Node require anchored at this template\'s directory: relative paths resolve against the .eta file\'s dir, bare names climb up searching node_modules; for ESM use the dynamic await import() form'],
+        ['_GET / _POST / _REQUEST', 'request parameters (plain objects; _REQUEST merges GET+POST, POST wins)'],
+        ['_SERVER', 'request environment (REQUEST_METHOD / SCRIPT_NAME / PATH_INFO / REQUEST_URI / SCRIPT_FILENAME / SCRIPT_DIRNAME / DOCUMENT_ROOT / HTTP_* etc.)'],
+        ['_BODY / _JSON', 'raw request body Buffer; auto-parsed when Content-Type contains json (null on failure)'],
+        ['_COOKIE', 'client cookie dict (values percent-decoded)'],
+        ['_SESSION', 'session object (signed cookie + timestamp, no server-side storage, sliding 30 minutes; mutate in place, do not reassign the whole object)'],
+      ]
+    })
+
+  if (config) {
+    const ttlMin = config.sessionTtl / 60000
+    const ttlStr = Number.isInteger(ttlMin) ? String(ttlMin) : ttlMin.toFixed(2)
+    const allowed = config.allowedHosts === null
+      ? 'disabled (--behind-proxy or --allowed-hosts all)'
+      : Object.keys(config.allowedHosts).join(', ')
+    sections.push({
+      title: 'Server Configuration',
+      pairs: [
+        ['Listen Address', config.host + ':' + config.port],
+        ['Document Root', config.root],
+        ['Session Timeout', ttlStr + ' minutes'],
+        ['Behind Proxy', config.behindProxy ? 'yes' : 'no'],
+        ['Allowed Hosts', allowed],
+      ]
+    })
+  }
+
+  return sections
+}
+
+function infoRenderCli (sections) {
+  const out = []
+  for (const sec of sections) {
+    out.push('[' + sec.title + ']')
+    if (sec.pairs) {
+      for (const [k, v] of sec.pairs) {
+        out.push(k + ' => ' + String(v).replace(/\n/g, '\\n'))
+      }
+    }
+    if (sec.subTables) {
+      for (const sub of sec.subTables) {
+        out.push('  [' + sub.header + ']')
+        for (const [k, v] of sub.pairs) {
+          out.push('  ' + k + ' => ' + String(v).replace(/\n/g, '\\n'))
+        }
+      }
+    }
+    out.push('')
+  }
+  return out.join('\n') + '\n'
+}
+
+function infoRenderHtml (sections) {
+  const nowStr = infoNowString()
+  const etaVer = infoEtaVersion()
+  const rows = []
+
+  for (const sec of sections) {
+    rows.push('<h2>' + escapeHtml(sec.title) + '</h2>')
+    if (sec.note) {
+      rows.push('<p class="note">' + escapeHtml(sec.note) + '</p>')
+    }
+    if (sec.pairs) {
+      rows.push('<table>')
+      for (const [k, v] of sec.pairs) {
+        rows.push('  <tr><td class="e">' + escapeHtml(k) + '</td>' +
+          '<td class="v">' + escapeHtml(String(v)).replace(/\n/g, '<br>') + '</td></tr>')
+      }
+      if (!sec.pairs.length) {
+        rows.push('  <tr><td class="e" colspan="2">(empty)</td></tr>')
+      }
+      rows.push('</table>')
+    }
+    if (sec.subTables) {
+      for (const sub of sec.subTables) {
+        rows.push('<h3>' + escapeHtml(sub.header) + '</h3>')
+        rows.push('<table>')
+        for (const [k, v] of sub.pairs) {
+          rows.push('  <tr><td class="e">' + escapeHtml(k) + '</td>' +
+            '<td class="v">' + escapeHtml(String(v)).replace(/\n/g, '<br>') + '</td></tr>')
+        }
+        if (!sub.pairs.length) {
+          rows.push('  <tr><td class="e" colspan="2">(empty)</td></tr>')
+        }
+        rows.push('</table>')
+      }
+    }
+  }
+
+  return '<!DOCTYPE html>\n' +
+    '<html>\n' +
+    '<head>\n' +
+    '<meta charset="utf-8">\n' +
+    '<title>etainfo()</title>\n' +
+    '<style>\n' +
+    'body {background:#fff; color:#222; margin:0; padding:0; ' +
+      'font-family:Verdana,Arial,Helvetica,sans-serif; font-size:12px;}\n' +
+    '.banner {background:#666699; color:#fff; padding:10px 18px;}\n' +
+    '.banner h1 {margin:0; font-size:22px; font-weight:bold;}\n' +
+    '.banner span {color:#ccccff;}\n' +
+    '.wrap {max-width:920px; margin:0 auto; padding:8px 18px 40px 18px;}\n' +
+    'h2 {background:#9999cc; color:#fff; font-size:14px; padding:4px 10px; ' +
+      'margin:26px 0 0 0;}\n' +
+    'h3 {color:#666699; font-size:12px; margin:10px 0 4px 0; ' +
+      'font-weight:bold;}\n' +
+    'table {border-collapse:collapse; width:100%; margin:0 0 2px 0;}\n' +
+    'td {border:1px solid #9999cc; padding:3px 8px; vertical-align:top;}\n' +
+    'td.e {background:#ccccff; font-weight:bold; width:300px;}\n' +
+    'td.v {background:#f8f8ff; word-break:break-all; white-space:pre-wrap;}\n' +
+    'td.h {background:#666699; color:#fff; font-weight:bold;}\n' +
+    'p.foot {color:#888; margin-top:30px;}\n' +
+    'p.note {color:#666; margin:4px 0 6px 0;}\n' +
+    'a {color:#666699;}\n' +
+    '</style>\n' +
+    '</head>\n' +
+    '<body>\n' +
+    '<div class="banner">\n' +
+    '<h1>etainfo() <span>- eta-server ' + escapeHtml(VERSION) + '</span></h1>\n' +
+    '</div>\n' +
+    '<div class="wrap">\n' +
+    rows.join('\n') + '\n' +
+    '<p class="foot">\n' +
+    'etainfo() - generated at ' + escapeHtml(nowStr) + ' by eta-server ' +
+      escapeHtml(VERSION) + '\n' +
+    '(Eta ' + escapeHtml(etaVer) + ' / Node.js ' + escapeHtml(process.version) + ')\n' +
+    '</p>\n' +
+    '</div>\n' +
+    '</body>\n' +
+    '</html>\n'
+}
+
+function renderInfo (bridge) {
+  const server = bridge._SERVER || Object.create(null)
+  const isCli = !server.REQUEST_URI
+  const sections = infoSections(bridge)
+  return isCli ? infoRenderCli(sections) : infoRenderHtml(sections)
+}
+
+/* ---------------------------------------------------------------------
  * response control object injected into templates as RESP
  * ------------------------------------------------------------------- */
 
@@ -845,6 +1120,11 @@ function makeResp (defaultStatus) {
     write: function () {
       // no-op alias: in eta, output goes through template text / <%= %>
       throw new Error('use template text or <%= %> for output')
+    },
+    info: function () {
+      // phpinfo()-style diagnostic page; HTML in HTTP mode, plain text
+      // in CLI mode. The bridge data is attached after makeResp returns.
+      return renderInfo(resp._infoBridge || Object.create(null))
     },
     escape: escapeHtml,
   }
@@ -1028,7 +1308,17 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     RESP: resp,
     escape: escapeHtml,
     require: makeDevRequire(ctx.rootReal, scriptAbs),
+    _infoConfig: {
+      sessionTtl: ctx.sessionTtl,
+      behindProxy: ctx.behindProxy,
+      allowedHosts: ctx.allowedHosts,
+      host: ctx.host,
+      port: ctx.port,
+      root: ctx.root,
+    },
   }
+  resp._infoBridge = data
+  resp._infoConfig = data._infoConfig
 
   let html = ''
   try {
@@ -1643,6 +1933,9 @@ async function renderCli (script, args) {
     require: createRequire(script === '-'
       ? path.join(baseDir, 'stdin.js') : scriptAbs),
   }
+  resp._infoBridge = data
+  resp._infoConfig = null
+
   const eta = new Eta({ views: baseDir, cache: false, useWith: true, autoTrim: false })
   let html = ''
   try {
