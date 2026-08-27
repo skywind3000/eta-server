@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.11.0'
+const VERSION = '0.12.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
@@ -42,6 +42,11 @@ const MULTIPART_MAX_FIELDS = 256
 const MULTIPART_MAX_FILES = 64
 const MULTIPART_MAX_FILE_SIZE = 16 * 1024 * 1024   // 16 MB per file
 const MULTIPART_MAX_HEADER_SIZE = 8192             // 8 KB per-part headers
+// form-urlencoded gets the same bounded surface: a 64MB body of
+// single-character pairs parses into tens of millions of dict entries
+// synchronously, blocking the event loop for seconds (memory / CPU
+// amplification on the exact channel the multipart guards cover)
+const FORM_MAX_FIELDS = 4096
 
 // Eta plugin: inject a per-invocation wrapper into the compiled template
 // so that RESP.write() / echo() emit text during rendering.
@@ -433,10 +438,15 @@ function readBody (req) {
   })
 }
 
+// returns null when the pair count exceeds FORM_MAX_FIELDS (the
+// caller answers 413); a 64MB body of tiny pairs used to build tens
+// of millions of entries synchronously
 function parseForm (buf) {
   const out = Object.create(null)
   const sp = new URLSearchParams(buf.toString('utf8'))
+  let count = 0
   for (const pair of sp.entries()) {
+    if (++count > FORM_MAX_FIELDS) return null
     out[pair[0]] = pair[1]
   }
   return out
@@ -498,16 +508,24 @@ function parseMultipart (buf, contentType) {
     tmpDir = null
   }
 
-  // split body on boundary; each part is between two boundary lines
-  // we scan byte by byte looking for boundary occurrences
+  // split body on boundary; each part is between two boundary lines.
+  // RFC 7578: a delimiter only counts at the START OF A LINE (the
+  // buffer start or right after \r\n). Matching the boundary string
+  // ANYWHERE (the old indexOf scan) truncated every upload whose
+  // content happened to contain the boundary bytes — empirically a
+  // 25-byte file came back as 5 bytes
   let pos = 0
   const parts = []
   while (true) {
-    const idx = buf.indexOf(boundaryBuf, pos)
+    let idx = buf.indexOf(boundaryBuf, pos)
+    while (idx !== -1 && idx !== 0 &&
+      !(buf[idx - 2] === 0x0d && buf[idx - 1] === 0x0a)) {
+      idx = buf.indexOf(boundaryBuf, idx + 1)   // mid-line: content
+    }
     if (idx === -1) break
     if (pos > 0) {
-      // part content is between the previous boundary end and this one
-      // strip trailing \r\n before the boundary
+      // part content is between the previous boundary end and this one;
+      // strip the trailing \r\n that precedes the delimiter line
       let end = idx
       if (end >= 2 && buf[end - 2] === 0x0d && buf[end - 1] === 0x0a) end -= 2
       parts.push(buf.slice(pos, end))
@@ -1631,6 +1649,17 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     }
   } else if (ctype.indexOf('application/x-www-form-urlencoded') >= 0) {
     post = parseForm(bodyBuf)
+    if (post === null) {
+      // too many pairs for the bounded surface (FORM_MAX_FIELDS); the
+      // multipart channel has its own guards (decision #27/#28)
+      if (opts.plain404OnError) {
+        console.error('eta-server: fallback page form parse exceeded the ' +
+          'field limit, degrading to the built-in 404')
+        return sendError(res, 404, 'Not Found')
+      }
+      return sendError(res, 413, 'Payload Too Large',
+        'form-urlencoded: too many fields')
+    }
   } else if (ctype.indexOf('json') >= 0) {
     // any json-ish content type (application/json, application/*+json,
     // text/json) is parsed
@@ -2382,7 +2411,15 @@ function startServer (rootDir, port, host, options) {
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
     return Promise.reject(new Error('document root not found: ' + root))
   }
-  port = Number(port) || 5000
+  // the CLI path validates -p itself (decision #14), but startServer
+  // is a public library API: a junk port used to fall silently back to
+  // 5000 (Number('abc') || 5000), starting the server somewhere the
+  // caller never asked for
+  port = Number(port)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return Promise.reject(new Error('invalid port (must be an integer ' +
+      'in 1-65535): ' + port))
+  }
   host = host || '127.0.0.1'
   options = options || {}
 

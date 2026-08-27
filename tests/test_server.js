@@ -480,6 +480,61 @@ async function main () {
       assert.strictEqual(res.status, 413)
     })
 
+    await check('multipart file content containing boundary bytes is ' +
+      'not truncated', async () => {
+        // RFC 7578: a delimiter only counts at the start of a line.
+        // The old anywhere-scan cut the file at the first boundary-
+        // looking byte sequence inside its content
+        writeDemo('t_upl2.eta', '<%~ _FILES.f.size %>')
+        const fileContent = 'head\n--B\n--B\ntail'
+        const res = await fetch(BASE + '/t_upl2.eta', {
+          method: 'POST',
+          headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+          body: '--B\r\n' +
+            'Content-Disposition: form-data; name="f"; ' +
+            'filename="in.txt"\r\n\r\n' +
+            fileContent + '\r\n--B--\r\n',
+        })
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(Number(await res.text()), fileContent.length)
+      })
+
+    await check('multipart field value containing boundary bytes ' +
+      'survives intact', async () => {
+        const res = await fetch(BASE + '/api.eta', {
+          method: 'POST',
+          headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+          body: '--B\r\nContent-Disposition: form-data; name="a"\r\n\r\n' +
+            'x--B--y\r\n--B--\r\n',
+        })
+        assert.strictEqual(res.status, 200)
+        const data = await res.json()
+        assert.deepStrictEqual(data.post, { a: 'x--B--y' })
+      })
+
+    await check('form-urlencoded too many fields returns 413', async () => {
+      // a 64MB body of tiny pairs used to parse into millions of dict
+      // entries synchronously; the channel is bounded like multipart
+      const pairs = []
+      for (let i = 0; i < 4097; i++) pairs.push('k' + i + '=v')
+      const res = await fetch(BASE + '/api.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: pairs.join('&'),
+      })
+      assert.strictEqual(res.status, 413)
+      // just under the limit still parses
+      pairs.pop()
+      const ok = await fetch(BASE + '/api.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: pairs.join('&'),
+      })
+      assert.strictEqual(ok.status, 200)
+      const data = await ok.json()
+      assert.strictEqual(data.post.k0, 'v')
+    })
+
     await check('_ENV exposes environment variables', async () => {
       // PATH is 'Path' on Windows; use a portable probe
       writeDemo('t_env.eta',
@@ -610,6 +665,17 @@ async function main () {
           { quiet: true, sessionTtl: 'abc' }),
         /invalid session TTL/)
     })
+
+    await check('invalid port rejects startServer (library API)',
+      async () => {
+        // Number('abc') || 5000 used to start the server on a port the
+        // caller never asked for
+        const mod = require(SERVER)
+        for (const p of ['abc', 0, -1, 70000, 5000.5]) {
+          await assert.rejects(mod.startServer(ROOT, p, '127.0.0.1',
+            { quiet: true }), /invalid port/)
+        }
+      })
 
     await check('require() demo works (node:path)', async () => {
       const res = await fetch(BASE + '/require.eta')
