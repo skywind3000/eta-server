@@ -326,7 +326,7 @@ Eta templates already have plain text and `<%= %>`, but switching in and out of 
 
 - both functions are injected into the template scope (`RESP` object and a standalone `echo` name) and are the same function;
 - output **interleaves** with surrounding template text and `<%= %>` interpolation: `A<% echo("X") %>B` renders `AXB`;
-- the implementation uses an Eta `processFnString` plugin to wrap the shared `RESP` object per invocation and override `write()` to push directly into Eta's internal `__eta.res` output string; the plugin matches the whole `let __eta = { ... };` declaration with a regex so it works with both Eta 3.5.0 and 4.6.0 (the declaration line gained a `blocks` property in 4.x, but `__eta.res` is still the output buffer); `package.json` allows `^3.5.0 || ^4.0.0`;
+- the implementation uses an Eta `processFnString` plugin to expose `RESP.write()` / `echo()` inside the compiled template. With Eta ≥ 4.1.0 it sets `outputFunctionName: '__templateOutputFunction'` and binds `RESP.write` / `echo` to that public helper (the helper is defined by Eta inside the template function and pushes into its internal output buffer — no direct `__eta` access from our side). With Eta 3.x the plugin falls back to injecting a wrapper that writes to `__eta.res` directly; `package.json` allows `^3.5.0 || ^4.0.0`;
 - `writeraw()` and `json()` still short-circuit all text output, so any `echo()` / `RESP.write()` calls are discarded when those channels are used (same priority as decision #6: binary > json text > rendered text);
 - in CLI mode the behavior is identical to HTTP mode.
 

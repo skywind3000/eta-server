@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.8.0'
+const VERSION = '0.9.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
@@ -36,16 +36,38 @@ const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
 const SESSION_COOKIE_LIMIT = 4096
 
 // Eta plugin: inject a per-invocation wrapper into the compiled template
-// so that RESP.write() / echo() push directly into __eta.res (the internal
-// output buffer), achieving correct interleaving with template text.
-// Object.create delegates all other methods to the shared RESP via the
-// prototype chain — only write() is overridden per invocation.
+// so that RESP.write() / echo() emit text during rendering.
+//
+// Eta 4.1+ path: with `outputFunctionName: '__templateOutputFunction'`
+// the compiled template defines a public helper function that pushes into
+// `__eta.res`. We bind RESP.write / echo to that helper — no internal
+// `__eta.res` access from our side.
+//
+// Eta 3.x fallback: no outputFunctionName support, so we create a wrapper
+// via Object.create and define a function that writes to `__eta.res`.
+//
+// In both cases the shared RESP object is left untouched; the wrapper is
+// created per invocation so concurrent async templates stay isolated.
 const WRITE_HOOK_PLUGIN = {
   processFnString: function (fnStr) {
-    // Match the whole `let __eta = { ... };` declaration. Eta 3.5.0 and
-    // 4.6.0 both accumulate output in `__eta.res`, but the declaration
-    // line differs slightly (4.x adds a `blocks` property). A regex that
-    // captures the whole line keeps the plugin compatible with both.
+    // Eta 4.1+: use the public outputFunctionName helper.
+    // The helper is declared inside the `with` block before template code,
+    // so we inject the binding right after it — that way echo()/RESP.write()
+    // are available while the template code executes.
+    if (fnStr.indexOf('function __templateOutputFunction') >= 0) {
+      return fnStr.replace(
+        /function __templateOutputFunction\(s\)\{__eta\.res\+=s;\}/,
+        function (match) {
+          return match + '\n' +
+            'if (it) {\n' +
+            '  it.RESP.write = __templateOutputFunction;\n' +
+            '  it.echo = it.RESP.write;\n' +
+            '}\n'
+        }
+      )
+    }
+    // Eta 3.x fallback: match the whole `let __eta = { ... };` declaration
+    // and inject a wrapper that writes to `__eta.res`.
     return fnStr.replace(
       /let __eta = \{[\s\S]*?\};\n/,
       function (match) {
@@ -2056,7 +2078,7 @@ async function renderCli (script, args) {
   resp._infoBridge = data
   resp._infoConfig = null
 
-  const eta = new Eta({ views: baseDir, cache: false, useWith: true, autoTrim: false, plugins: [WRITE_HOOK_PLUGIN] })
+  const eta = new Eta({ views: baseDir, cache: false, useWith: true, autoTrim: false, outputFunctionName: '__templateOutputFunction', plugins: [WRITE_HOOK_PLUGIN] })
   let html = ''
   try {
     html = await eta.renderStringAsync(src, data)
@@ -2144,7 +2166,7 @@ function startServer (rootDir, port, host, options) {
     // persisted key AND the per-root derivation (decision #21)
     secret: deriveSecret(root, options.secret),
     sessionTtl: sessionTtl,
-    eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false, plugins: [WRITE_HOOK_PLUGIN] }),
+    eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false, outputFunctionName: '__templateOutputFunction', plugins: [WRITE_HOOK_PLUGIN] }),
     accessLog: accessLog,
     allowedHosts: allowedHosts,
     behindProxy: behindProxy,
