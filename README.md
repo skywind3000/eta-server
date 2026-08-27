@@ -107,8 +107,10 @@ All bridge names are available bare in templates (thanks to Eta `useWith`); the 
 
 | Name | Description |
 |---|---|
-| `_GET` / `_POST` / `_REQUEST` | query params / form-urlencoded body / merged (POST wins) |
+| `_GET` / `_POST` / `_REQUEST` | query params / form-urlencoded + multipart fields / merged (POST wins) |
 | `_SERVER` | request environment: `REQUEST_METHOD`, `QUERY_STRING`, `REQUEST_URI`, `SCRIPT_NAME`, `PATH_INFO`, `SCRIPT_FILENAME`, `SCRIPT_DIRNAME`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME`, `SERVER_PORT`, `REQUEST_SCHEME` (the first, third and sixth follow `X-Forwarded-*` under `--behind-proxy`), `SERVER_PROTOCOL`, `REQUEST_TIME` / `REQUEST_TIME_FLOAT`, `HTTP_*` headers, plus `argv` in CLI mode |
+| `_ENV` | environment variables snapshot (like PHP `$_ENV`) |
+| `_FILES` | uploaded files from multipart/form-data — PHP `$_FILES` shape (`name`/`type`/`size`/`tmp_name`/`error`); temp files cleaned up after the response |
 | `_COOKIE` | cookie dict (values percent-decoded) |
 | `_SESSION` | session object — signed-cookie based, no server-side storage, sliding 30-minute timeout. Mutate in place, or reassign the whole object (`_SESSION = {}`) to clear it |
 | `_BODY` | raw request body (Buffer, like `php://input`) |

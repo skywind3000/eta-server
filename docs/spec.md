@@ -330,12 +330,28 @@ Eta templates already have plain text and `<%= %>`, but switching in and out of 
 - `writeraw()` and `json()` still short-circuit all text output, so any `echo()` / `RESP.write()` calls are discarded when those channels are used (same priority as decision #6: binary > json text > rendered text);
 - in CLI mode the behavior is identical to HTTP mode.
 
+### Decision #26: `_ENV` and `_FILES` — environment snapshot and multipart file uploads
+
+Two PHP superglobals were missing from the bridge API:
+
+**`_ENV`** — a request-level snapshot of `process.env` exposed as a null-prototype dict, mirroring PHP `$_ENV`. It is a copy taken at request start (immutable within the request) and lives alongside the other bridge dicts. Templates can also access `process.env` directly via the Node global, so `_ENV` is primarily a PHP-parity convenience plus the null-prototype safety the other dicts already have;
+
+**`_FILES`** — multipart/form-data parsing and file upload handling. Previously a multipart POST emitted a stderr warning and left `_POST` empty. Now:
+
+- the multipart body is parsed into regular fields (merged into `_POST`) and file uploads (in `_FILES`);
+- `_FILES` follows PHP's shape: each field is `{ name, type, size, tmp_name, error }`; repeated `name="f[]"` uploads produce the array-of-columns structure `{ name: [...], type: [...], size: [...], tmp_name: [...], error: [...] }`;
+- file contents are written to a per-request temp directory under `os.tmpdir()` so `tmp_name` is a real path the template can read with `fs`, matching PHP semantics; error codes follow PHP's `UPLOAD_ERR_*` constants (`UPLOAD_ERR_NO_FILE` for an empty filename, `UPLOAD_ERR_NO_TMP_DIR` when the temp dir cannot be created, `UPLOAD_ERR_CANT_WRITE` on write failure);
+- temp files and their directory are cleaned up on the response `close` event, so aborted requests do not leak disk space;
+- CLI render mode has no request body, so `_FILES` is an empty object there.
+
 ## Bridge API list
 
 | Name | Type | Description |
 |---|---|---|
-| `_GET` / `_POST` / `_REQUEST` | object | query / form-urlencoded / merged (later wins) |
+| `_GET` / `_POST` / `_REQUEST` | object | query / form-urlencoded + multipart fields / merged (later wins) |
 | `_SERVER` | object | see below |
+| `_ENV` | object | environment variables snapshot (null-prototype dict), equivalent to PHP `$_ENV` |
+| `_FILES` | object | uploaded files from multipart/form-data (decision #26); PHP `$_FILES` shape: `name` / `type` / `size` / `tmp_name` / `error` per field, array-of-columns for `name="f[]"` |
 | `_COOKIE` | object | cookie dict after percent-decode |
 | `_SESSION` | object | signed-cookie session (decision #5); whole cookie over 4KB → 500 (decision #13); wholesale reassignment (`_SESSION = {}` / `null` / `undefined` / `false`) clears the session, read back after rendering (decisions #17/#20); null-prototype like every other dict, on the fresh request as well as the restored one (decisions #20/#22); values must be JSON-serializable — a BigInt / circular value gives a 500 naming the constraint, or a clean 404 from `.404.eta` (decision #22) |
 | `_BODY` | Buffer | raw request body (counterpart of `php://input`) |

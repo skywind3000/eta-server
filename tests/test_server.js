@@ -392,21 +392,46 @@ async function main () {
       assert.deepStrictEqual(data.json, { hello: 'eta' })
     })
 
-    await check('multipart POST warns on stderr, _POST stays empty',
-      async () => {
-        const res = await fetch(BASE + '/api.eta', {
-          method: 'POST',
-          headers: { 'Content-Type': 'multipart/form-data; boundary=X' },
-          body: '--X\r\nContent-Disposition: form-data; name="a"\r\n\r\n' +
-            '1\r\n--X--\r\n',
-        })
-        assert.strictEqual(res.status, 200)
-        const data = await res.json()
-        assert.deepStrictEqual(data.post, {})
-        await new Promise(r => setTimeout(r, 100))
-        assert.ok(stderr.indexOf('multipart') >= 0,
-          'stderr missing the multipart warning')
+    await check('multipart POST parses fields into _POST', async () => {
+      const res = await fetch(BASE + '/api.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=X' },
+        body: '--X\r\nContent-Disposition: form-data; name="a"\r\n\r\n' +
+          '1\r\n--X--\r\n',
       })
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.deepStrictEqual(data.post, { a: '1' })
+    })
+
+    await check('multipart POST uploads a file into _FILES', async () => {
+      writeDemo('t_upl.eta',
+        '<%~ JSON.stringify({name:_FILES.f.name,size:_FILES.f.size,type:_FILES.f.type,err:_FILES.f.error}) %>')
+      const fileContent = 'hello upload'
+      const res = await fetch(BASE + '/t_upl.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+        body: '--B\r\n' +
+          'Content-Disposition: form-data; name="f"; filename="test.txt"\r\n' +
+          'Content-Type: text/plain\r\n\r\n' +
+          fileContent + '\r\n--B--\r\n',
+      })
+      assert.strictEqual(res.status, 200)
+      const data = JSON.parse(await res.text())
+      assert.strictEqual(data.name, 'test.txt')
+      assert.strictEqual(data.size, fileContent.length)
+      assert.strictEqual(data.type, 'text/plain')
+      assert.strictEqual(data.err, 0)
+    })
+
+    await check('_ENV exposes environment variables', async () => {
+      // PATH is 'Path' on Windows; use a portable probe
+      writeDemo('t_env.eta',
+        '<%~ (_ENV.PATH || _ENV.Path) ? "has-path" : "no-path" %>')
+      const res = await fetch(BASE + '/t_env.eta')
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(await res.text(), 'has-path')
+    })
 
     await check('session cookie persists across requests', async () => {
       const r1 = await fetch(BASE + '/index.eta')

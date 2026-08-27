@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.9.0'
+const VERSION = '0.10.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
@@ -434,6 +434,151 @@ function parseForm (buf) {
   return out
 }
 
+// PHP $_ENV: a request-level snapshot of process.env as a null-prototype
+// dict. Unlike process.env (a plain object with Object.prototype), this
+// is safe against prototype-pollution-style key lookups in templates.
+function buildEnvSnapshot () {
+  return Object.assign(Object.create(null), process.env)
+}
+
+// PHP $_FILES upload error codes (match PHP UPLOAD_ERR_* constants)
+const UPLOAD_ERR_OK = 0
+const UPLOAD_ERR_INI_SIZE = 1
+const UPLOAD_ERR_FORM_SIZE = 2
+const UPLOAD_ERR_PARTIAL = 3
+const UPLOAD_ERR_NO_FILE = 4
+const UPLOAD_ERR_NO_TMP_DIR = 6
+const UPLOAD_ERR_CANT_WRITE = 7
+const UPLOAD_ERR_EXTENSION = 8
+
+// Parse a multipart/form-data body into { fields, files }.
+// `fields` is a plain dict of name -> value (last value wins for
+// repeated names, matching how URLSearchParams behaves).
+// `files` follows PHP's $_FILES shape:
+//   single:  files[name] = { name, type, size, tmp_name, error }
+//   multiple (name="f[]"): files[name] = { name:[...], type:[...],
+//            size:[...], tmp_name:[...], error:[...] }
+// File contents are written to a temp directory so templates can read
+// them via fs, mirroring PHP's tmp_name semantics. The caller receives
+// the list of temp file paths so it can clean them up after the response.
+function parseMultipart (buf, contentType) {
+  const fields = Object.create(null)
+  const files = Object.create(null)
+  const tempFiles = []
+
+  // extract boundary from Content-Type
+  const m = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i)
+  if (!m) return { fields, files, tempFiles }
+  const boundary = '--' + (m[1] || m[2]).trim()
+  const boundaryBuf = Buffer.from(boundary, 'latin1')
+  const endBoundaryBuf = Buffer.from(boundary + '--', 'latin1')
+
+  // create a temp directory for uploaded files
+  let tmpDir = null
+  try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eta-up-'))
+  } catch (e) {
+    // no temp dir available: files will have tmp_name '' and error set
+    tmpDir = null
+  }
+
+  // split body on boundary; each part is between two boundary lines
+  // we scan byte by byte looking for boundary occurrences
+  let pos = 0
+  const parts = []
+  while (true) {
+    const idx = buf.indexOf(boundaryBuf, pos)
+    if (idx === -1) break
+    if (pos > 0) {
+      // part content is between the previous boundary end and this one
+      // strip trailing \r\n before the boundary
+      let end = idx
+      if (end >= 2 && buf[end - 2] === 0x0d && buf[end - 1] === 0x0a) end -= 2
+      parts.push(buf.slice(pos, end))
+    }
+    // move past this boundary line (boundary + \r\n, or boundary + --)
+    const after = idx + boundaryBuf.length
+    if (buf.slice(idx, idx + endBoundaryBuf.length).equals(endBoundaryBuf)) {
+      break // final boundary
+    }
+    pos = after
+    // skip \r\n after boundary
+    if (buf[pos] === 0x0d && buf[pos + 1] === 0x0a) pos += 2
+  }
+
+  for (const part of parts) {
+    // split headers from body at the first blank line (\r\n\r\n)
+    const headerEnd = part.indexOf('\r\n\r\n')
+    if (headerEnd === -1) continue
+    const headerBlock = part.slice(0, headerEnd).toString('latin1')
+    const body = part.slice(headerEnd + 4)
+
+    // parse Content-Disposition
+    const nameMatch = headerBlock.match(/name="([^"]*)"/i)
+    const fileMatch = headerBlock.match(/filename="([^"]*)"/i)
+    const typeMatch = headerBlock.match(/content-type:\s*([^\r\n]+)/i)
+
+    if (!nameMatch) continue
+    let fieldName = nameMatch[1]
+
+    if (fileMatch) {
+      // file upload
+      const origName = fileMatch[1]
+      const mime = typeMatch ? typeMatch[1].trim() : 'application/octet-stream'
+      const isArrayField = fieldName.endsWith('[]')
+      if (isArrayField) fieldName = fieldName.slice(0, -2)
+
+      let tmpName = ''
+      let err = UPLOAD_ERR_OK
+      if (tmpDir === null) {
+        err = UPLOAD_ERR_NO_TMP_DIR
+      } else if (origName === '') {
+        // empty filename means no file was selected (PHP UPLOAD_ERR_NO_FILE)
+        err = UPLOAD_ERR_NO_FILE
+      } else {
+        try {
+          const fname = path.join(tmpDir, 'up-' +
+            crypto.randomBytes(8).toString('hex'))
+          fs.writeFileSync(fname, body)
+          tmpName = fname
+          tempFiles.push(fname)
+        } catch (e) {
+          err = UPLOAD_ERR_CANT_WRITE
+        }
+      }
+
+      const entry = {
+        name: origName,
+        type: mime,
+        size: body.length,
+        tmp_name: tmpName,
+        error: err,
+      }
+
+      if (isArrayField) {
+        if (!files[fieldName]) {
+          files[fieldName] = {
+            name: [], type: [], size: [], tmp_name: [], error: [],
+          }
+        }
+        const arr = files[fieldName]
+        arr.name.push(entry.name)
+        arr.type.push(entry.type)
+        arr.size.push(entry.size)
+        arr.tmp_name.push(entry.tmp_name)
+        arr.error.push(entry.error)
+      } else {
+        files[fieldName] = entry
+      }
+    } else {
+      // regular form field
+      fields[fieldName] = body.toString('utf8')
+    }
+  }
+
+  return { fields, files, tempFiles, tmpDir }
+}
+
 /* ---------------------------------------------------------------------
  * access log (decision #16)
  * ------------------------------------------------------------------- */
@@ -813,6 +958,13 @@ function infoSortedEntries (obj) {
   return Object.keys(obj).sort().map(k => [k, obj[k]])
 }
 
+function infoFilesEntries (obj) {
+  return Object.keys(obj).sort().map(k => {
+    const v = obj[k]
+    return [k, JSON.stringify(v)]
+  })
+}
+
 function infoNowString () {
   const now = new Date()
   const pad = (n) => String(n).padStart(2, '0')
@@ -997,6 +1149,7 @@ function infoSections (bridge) {
         { header: '_POST', pairs: infoSortedEntries(bridge._POST || Object.create(null)) },
         { header: '_REQUEST (GET + POST)', pairs: infoSortedEntries(bridge._REQUEST || Object.create(null)) },
         { header: '_COOKIE', pairs: infoSortedEntries(bridge._COOKIE || Object.create(null)) },
+        { header: '_FILES', pairs: infoFilesEntries(bridge._FILES || Object.create(null)) },
       ]
     })
 
@@ -1033,6 +1186,8 @@ function infoSections (bridge) {
         ['require(spec)', 'Node require anchored at this template\'s directory: relative paths resolve against the .eta file\'s dir, bare names climb up searching node_modules; for ESM use the dynamic await import() form'],
         ['_GET / _POST / _REQUEST', 'request parameters (plain objects; _REQUEST merges GET+POST, POST wins)'],
         ['_SERVER', 'request environment (REQUEST_METHOD / SCRIPT_NAME / PATH_INFO / REQUEST_URI / SCRIPT_FILENAME / SCRIPT_DIRNAME / DOCUMENT_ROOT / HTTP_* etc.)'],
+        ['_ENV', 'environment variables snapshot (null-prototype dict, like PHP $_ENV)'],
+        ['_FILES', 'uploaded files from multipart/form-data (PHP $_FILES shape: name/type/size/tmp_name/error per field; temp files cleaned up after the response)'],
         ['_BODY / _JSON', 'raw request body Buffer; auto-parsed when Content-Type contains json (null on failure)'],
         ['_COOKIE', 'client cookie dict (values percent-decoded)'],
         ['_SESSION', 'session object (signed cookie + timestamp, no server-side storage, sliding 30 minutes; mutate in place, do not reassign the whole object)'],
@@ -1389,12 +1544,27 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
 
   let post = Object.create(null)
   let jsonVal = null
+  let files = Object.create(null)
+  let uploadedTempFiles = []
   const ctype = String(req.headers['content-type'] || '')
   if (ctype.indexOf('multipart/form-data') >= 0) {
-    // _FILES is phase two; without this line a multipart form would
-    // "submit successfully" with every parameter silently missing
-    console.error('eta-server: warning: multipart/form-data body is not ' +
-      'parsed (no _FILES yet); _POST stays empty, raw bytes in _BODY')
+    const parsed = parseMultipart(bodyBuf, ctype)
+    post = parsed.fields
+    files = parsed.files
+    uploadedTempFiles = parsed.tempFiles
+    // clean up uploaded temp files once the response finishes or the
+    // connection closes (whichever comes first, including aborts)
+    if (uploadedTempFiles.length || parsed.tmpDir) {
+      const cleanupUploads = () => {
+        for (const f of uploadedTempFiles) {
+          try { fs.unlinkSync(f) } catch (e) { /* already gone */ }
+        }
+        if (parsed.tmpDir) {
+          try { fs.rmdirSync(parsed.tmpDir) } catch (e) { /* ignore */ }
+        }
+      }
+      res.once('close', cleanupUploads)
+    }
   } else if (ctype.indexOf('application/x-www-form-urlencoded') >= 0) {
     post = parseForm(bodyBuf)
   } else if (ctype.indexOf('json') >= 0) {
@@ -1432,6 +1602,8 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
       ctx, reqStart),
     _COOKIE: cookies,
     _SESSION: session,
+    _ENV: buildEnvSnapshot(),
+    _FILES: files,
     _BODY: bodyBuf,
     _JSON: jsonVal,
     RESP: resp,
@@ -2068,6 +2240,8 @@ async function renderCli (script, args) {
     // null-prototype like every other bridge dict, and like the HTTP
     // side on both the fresh and the restored path (decision #22)
     _SESSION: Object.create(null),
+    _ENV: buildEnvSnapshot(),
+    _FILES: Object.create(null),
     _BODY: Buffer.alloc(0),
     _JSON: null,
     RESP: resp,

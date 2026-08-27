@@ -43,7 +43,9 @@ Variables/functions exposed by the Node side to .eta templates, named and semant
 ### Request (PHP superglobal naming)
 
 - `_REQUEST` — merged request parameter dict (query and form post merged, the latter wins);
-- `_GET` / `_POST` — GET and POST parameter dicts separately; `_POST` parses `application/x-www-form-urlencoded` only; JSON request bodies go into `_JSON`;
+- `_GET` / `_POST` — GET and POST parameter dicts separately; `_POST` parses `application/x-www-form-urlencoded` and `multipart/form-data` (fields only; file uploads go into `_FILES`); JSON request bodies go into `_JSON`;
+- `_ENV` — environment variables snapshot (null-prototype dict, equivalent to PHP `$_ENV`);
+- `_FILES` — uploaded files from `multipart/form-data` requests, following PHP's `$_FILES` shape (`name` / `type` / `size` / `tmp_name` / `error` per field); file contents are stored in temp files that are automatically cleaned up after the response; repeated `name="f[]"` uploads produce the array-of-columns structure PHP uses;
 - `_SERVER` — request environment dict, containing at least: `REQUEST_METHOD`, `QUERY_STRING`, `REQUEST_URI`, `SCRIPT_NAME`, `PATH_INFO`, `SCRIPT_FILENAME`, `SCRIPT_DIRNAME`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME` (the hostname the client asked for, taken from the allowlisted `Host` header per CGI semantics — the bind address is the fallback when a client sends no Host), `SERVER_PORT`, `REQUEST_SCHEME`, `SERVER_PROTOCOL`, `REQUEST_TIME` / `REQUEST_TIME_FLOAT`, and client request headers in `HTTP_*` form. Under `--behind-proxy`, `REMOTE_ADDR` / `REQUEST_SCHEME` / `SERVER_NAME` come from the `X-Forwarded-*` headers instead (see the CLI section) — those headers are ignored without the flag;
 - `_BODY` — raw request body (Buffer, equivalent to PHP's `php://input`); when Content-Type is JSON, `_JSON` is also provided (auto-parsed to an object, otherwise null); request body size defaults to a 64MB cap, over-cap returns 413;
 - `_COOKIE` — client cookie dict (values percent-decoded);
@@ -71,7 +73,6 @@ Variables/functions exposed by the Node side to .eta templates, named and semant
 
 ### Not implemented (phase two)
 
-- `_FILES` — file uploads (multipart parsing); until then, `multipart/form-data` requests emit a per-request stderr warning so parameters are never silently lost (raw bytes stay in `_BODY`);
 - Configuration files (ini / json);
 - CLI arguments for absolute timeouts (the session timeout is idle-based sliding only — `--session-ttl` changes its length, not its semantics).
 
