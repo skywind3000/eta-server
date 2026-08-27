@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.5.2'
+const VERSION = '0.6.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'etasess'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
@@ -816,6 +816,47 @@ function infoModuleSearchPaths (scriptDirname) {
   return out.join('\n')
 }
 
+function infoInstalledPackages (docRoot) {
+  if (!docRoot) return []
+  const pkgFile = path.join(docRoot, 'package.json')
+  let pkg
+  try { pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8')) } catch { return [] }
+  const deps = Object.entries(pkg.dependencies || {}).map(
+    ([name, ver]) => ({ name, version: String(ver), dev: false }))
+  const devDeps = Object.entries(pkg.devDependencies || {}).map(
+    ([name, ver]) => ({ name, version: String(ver), dev: true }))
+  return deps.concat(devDeps).sort((a, b) => a.name.localeCompare(b.name))
+}
+
+// read npm's version from its bundled package.json next to the Node.js
+// binary — works cross-platform without spawning a subprocess.
+function infoNpmVersion () {
+  let dir = path.dirname(process.execPath)
+  while (true) {
+    const f = path.join(dir, 'node_modules', 'npm', 'package.json')
+    try {
+      const pkg = JSON.parse(fs.readFileSync(f, 'utf8'))
+      if (pkg.name === 'npm') return pkg.version || '?'
+    } catch { /* not here */ }
+    const parent = path.dirname(dir)
+    if (parent === dir) return null
+    dir = parent
+  }
+}
+
+// walk up from a start directory looking for the nearest package.json,
+// returning its containing directory (or null).
+function infoProjectRoot (startDir) {
+  if (!startDir) return null
+  let dir = startDir
+  while (true) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) return null
+    dir = parent
+  }
+}
+
 function infoSections (bridge) {
   const server = bridge._SERVER || Object.create(null)
   const config = bridge._infoConfig || null
@@ -824,16 +865,32 @@ function infoSections (bridge) {
 
   const sections = []
 
+  const runtimeExtra = Object.entries(process.versions)
+    .filter(([k]) => k !== 'node')
+    .map(([k, v]) => k + ' ' + v)
+    .join(', ')
+  const cpuCount = (os.cpus() || []).length
+
   sections.push({
     title: 'System',
     pairs: [
         ['eta-server Version', VERSION],
         ['Node.js Version', process.version],
         ['Node.js Executable', process.execPath],
+        ...(runtimeExtra
+          ? [['Node.js Runtime', runtimeExtra]]
+          : []),
         ['Platform', os.platform() + ' ' + os.release()],
         ['OS / Architecture', os.type() + ' / ' + os.arch()],
         ['Hostname', os.hostname()],
+        ...(cpuCount
+          ? [['Machine', cpuCount + ' CPU(s)']]
+          : []),
+        ['System Uptime',
+          (os.uptime() / 3600).toFixed(1) + ' hours'],
         ['Process ID', String(process.pid)],
+        ['Process Uptime',
+          (process.uptime() / 3600).toFixed(1) + ' hours'],
         ['Current Working Directory', process.cwd()],
         ['Memory (RSS / Heap Used)',
           (mu.rss / 1048576).toFixed(1) + ' MB / ' +
@@ -842,13 +899,47 @@ function infoSections (bridge) {
       ]
     })
 
+  const fwPairs = [
+    ['Eta', infoEtaVersion()],
+    ['Node.js', process.version],
+  ]
+  const npmVer = infoNpmVersion()
+  if (npmVer) fwPairs.push(['npm', npmVer])
+
+  const docRoot = server.DOCUMENT_ROOT
+    || infoProjectRoot(server.SCRIPT_DIRNAME || process.cwd())
+  const pkgs = infoInstalledPackages(docRoot)
+  if (pkgs.length) {
+    const depCount = pkgs.filter(p => !p.dev).length
+    const devCount = pkgs.filter(p => p.dev).length
+    const counts = [depCount + ' dependencies', devCount + ' devDependencies']
+      .filter(s => !s.startsWith('0 ')).join(', ')
+    fwPairs.push(['Installed Packages (' + counts + ')',
+      pkgs.map(p => p.name + ' ' + p.version + (p.dev ? ' (dev)' : '')).join('\n')])
+  }
+
   sections.push({
     title: 'Frameworks & Dependencies',
+    pairs: fwPairs
+  })
+
+  if (config) {
+    const ttlMin = config.sessionTtl / 60000
+    const ttlStr = Number.isInteger(ttlMin) ? String(ttlMin) : ttlMin.toFixed(2)
+    const allowed = config.allowedHosts === null
+      ? 'disabled (--behind-proxy or --allowed-hosts all)'
+      : Object.keys(config.allowedHosts).join(', ')
+    sections.push({
+      title: 'Server Configuration',
       pairs: [
-        ['Eta', infoEtaVersion()],
-        ['Node.js', process.version],
+        ['Listen Address', config.host + ':' + config.port],
+        ['Document Root', config.root],
+        ['Session Timeout', ttlStr + ' minutes'],
+        ['Behind Proxy', config.behindProxy ? 'yes' : 'no'],
+        ['Allowed Hosts', allowed],
       ]
     })
+  }
 
   sections.push({ title: 'This Request (_SERVER)', pairs: infoSortedEntries(server) })
   sections.push({
@@ -898,24 +989,6 @@ function infoSections (bridge) {
         ['_SESSION', 'session object (signed cookie + timestamp, no server-side storage, sliding 30 minutes; mutate in place, do not reassign the whole object)'],
       ]
     })
-
-  if (config) {
-    const ttlMin = config.sessionTtl / 60000
-    const ttlStr = Number.isInteger(ttlMin) ? String(ttlMin) : ttlMin.toFixed(2)
-    const allowed = config.allowedHosts === null
-      ? 'disabled (--behind-proxy or --allowed-hosts all)'
-      : Object.keys(config.allowedHosts).join(', ')
-    sections.push({
-      title: 'Server Configuration',
-      pairs: [
-        ['Listen Address', config.host + ':' + config.port],
-        ['Document Root', config.root],
-        ['Session Timeout', ttlStr + ' minutes'],
-        ['Behind Proxy', config.behindProxy ? 'yes' : 'no'],
-        ['Allowed Hosts', allowed],
-      ]
-    })
-  }
 
   return sections
 }
