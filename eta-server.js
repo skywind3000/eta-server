@@ -27,9 +27,9 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.6.0'
+const VERSION = '0.7.0'
 const MAX_BODY = 64 * 1024 * 1024
-const SESSION_COOKIE = 'etasess'
+const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
 // cookie capacity guard: an oversized session
 // cookie is silently dropped by browsers anyway; fail loudly instead

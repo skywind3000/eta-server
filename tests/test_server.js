@@ -120,7 +120,7 @@ async function waitForReady (tries) {
   return false
 }
 
-// extract "Set-Cookie: etasess=..." value from a fetch Response
+// extract "Set-Cookie: ETASESSION=..." value from a fetch Response
 function getSessionCookie (res) {
   const all = res.headers.getSetCookie ? res.headers.getSetCookie() : []
   for (const item of all) {
@@ -129,7 +129,7 @@ function getSessionCookie (res) {
   return null
 }
 
-function SESSION_NAME () { return 'etasess=' }
+function SESSION_NAME () { return 'ETASESSION=' }
 
 async function main () {
   const child = spawn(process.execPath,
@@ -412,7 +412,7 @@ async function main () {
       const r1 = await fetch(BASE + '/index.eta')
       await r1.text()
       const cookie = getSessionCookie(r1)
-      assert.ok(cookie, 'first response must set etasess cookie')
+      assert.ok(cookie, 'first response must set ETASESSION cookie')
       const r2 = await fetch(BASE + '/index.eta', {
         headers: { Cookie: cookie }
       })
@@ -420,7 +420,7 @@ async function main () {
       assert.ok(body2.indexOf('Visits in this session: <b>2</b>') >= 0)
       // sliding session: must chain the re-signed cookie from r2
       const cookie2 = getSessionCookie(r2)
-      assert.ok(cookie2, 'second response must re-sign etasess cookie')
+      assert.ok(cookie2, 'second response must re-sign ETASESSION cookie')
       const r3 = await fetch(BASE + '/index.eta', {
         headers: { Cookie: cookie2 }
       })
@@ -434,7 +434,7 @@ async function main () {
       const cookie = getSessionCookie(r1)
       assert.ok(cookie)
       // corrupt the payload part (keep signature)
-      const tampered = cookie.replace('etasess=', 'etasess=xx')
+      const tampered = cookie.replace('ETASESSION=', 'ETASESSION=xx')
       const r2 = await fetch(BASE + '/index.eta', {
         headers: { Cookie: tampered }
       })
@@ -461,13 +461,13 @@ async function main () {
         const body3 = await r3.text()
         assert.ok(body3.indexOf('"n":2') >= 0)
         const all = r3.headers.getSetCookie ? r3.headers.getSetCookie() : []
-        const cleared = all.filter((c) => c.startsWith('etasess=') &&
+        const cleared = all.filter((c) => c.startsWith('ETASESSION=') &&
           c.indexOf('Max-Age=0') >= 0)
         assert.strictEqual(cleared.length, 1,
           'cleared session must emit one Max-Age=0 cookie')
         // the browser now holds the cleared cookie; counting restarts
         const c3 = getSessionCookie(r3)
-        assert.strictEqual(c3, 'etasess=')
+        assert.strictEqual(c3, 'ETASESSION=')
         const r4 = await fetch(BASE + '/t_sesscount.eta',
           { headers: { Cookie: c3 } })
         assert.strictEqual(await r4.text(), '1')
@@ -488,7 +488,7 @@ async function main () {
           { headers: { Cookie: c1 } })
         assert.strictEqual(await r2.text(), 'cleared')
         const all = r2.headers.getSetCookie ? r2.headers.getSetCookie() : []
-        const cleared = all.filter((c) => c.startsWith('etasess=') &&
+        const cleared = all.filter((c) => c.startsWith('ETASESSION=') &&
           c.indexOf('Max-Age=0') >= 0)
         assert.strictEqual(cleared.length, 1,
           '_SESSION = false must emit the Max-Age=0 clear')
@@ -913,13 +913,13 @@ async function main () {
           const r8 = await rawGet(portP, 'example.com', '/t_sessprx.eta',
             { 'X-Forwarded-Proto': 'https' })
           const sc = (r8.headers['set-cookie'] || [])
-            .filter((c) => c.startsWith('etasess='))
+            .filter((c) => c.startsWith('ETASESSION='))
           assert.strictEqual(sc.length, 1)
           assert.ok(sc[0].indexOf('; Secure') >= 0,
             'https request must get a Secure session cookie: ' + sc[0])
           const r9 = await rawGet(portP, 'example.com', '/t_sessprx.eta')
           const sc9 = (r9.headers['set-cookie'] || [])
-            .filter((c) => c.startsWith('etasess='))
+            .filter((c) => c.startsWith('ETASESSION='))
           assert.ok(sc9[0].indexOf('Secure') < 0,
             'plain http must not get a Secure cookie: ' + sc9[0])
         } finally {
@@ -1088,7 +1088,7 @@ async function main () {
             '/t_plain.eta', { headers: { Cookie: c1 } })
           assert.strictEqual(await r3.text(), 'plain')
           const all = r3.headers.getSetCookie ? r3.headers.getSetCookie() : []
-          const cleared = all.filter((c) => c.startsWith('etasess=') &&
+          const cleared = all.filter((c) => c.startsWith('ETASESSION=') &&
             c.indexOf('Max-Age=0') >= 0)
           assert.strictEqual(cleared.length, 0,
             'a verifiable cookie must not be cleared')
@@ -1187,13 +1187,13 @@ async function main () {
 
     await check('session cookie name monopoly (setcookie dropped)', async () => {
       writeDemo('t_sessmono.eta',
-        '<% _SESSION.k = 1 %><% RESP.setcookie("etasess", "evil") %>ok')
+        '<% _SESSION.k = 1 %><% RESP.setcookie("ETASESSION", "evil") %>ok')
       const res = await fetch(BASE + '/t_sessmono.eta')
       assert.strictEqual(res.status, 200)
       await res.text()
       const all = res.headers.getSetCookie
         ? res.headers.getSetCookie() : []
-      const sess = all.filter((c) => c.startsWith('etasess='))
+      const sess = all.filter((c) => c.startsWith('ETASESSION='))
       assert.strictEqual(sess.length, 1)
       assert.ok(sess[0].indexOf('evil') < 0)
     })
