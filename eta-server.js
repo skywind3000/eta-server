@@ -27,13 +27,33 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.7.0'
+const VERSION = '0.8.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
 // cookie capacity guard: an oversized session
 // cookie is silently dropped by browsers anyway; fail loudly instead
 const SESSION_COOKIE_LIMIT = 4096
+
+// Eta plugin: inject a per-invocation wrapper into the compiled template
+// so that RESP.write() / echo() push directly into __eta.res (the internal
+// output buffer), achieving correct interleaving with template text.
+// Object.create delegates all other methods to the shared RESP via the
+// prototype chain — only write() is overridden per invocation.
+const WRITE_HOOK_PLUGIN = {
+  processFnString: function (fnStr) {
+    return fnStr.replace(
+      'let __eta = {res: "", e: this.config.escapeFunction, f: this.config.filterFunction};',
+      'let __eta = {res: "", e: this.config.escapeFunction, f: this.config.filterFunction};\n' +
+      'if (it) {\n' +
+      '  it.RESP = Object.create(it.RESP || {});\n' +
+      '  it.RESP.write = function(s){__eta.res += (s==null?"":String(s))};\n' +
+      '  it.echo = it.RESP.write;\n' +
+      '}\n'
+    )
+  }
+}
+
 const SELF_PATH = path.resolve(__filename)
 
 // canonical realpath (decision #20). fs.realpathSync — the JS
@@ -980,6 +1000,7 @@ function infoSections (bridge) {
         ['RESP.json(data)', 'JSON response (Content-Type: application/json; does not stop rendering, pair it with a top-level return)'],
         ['RESP.setcookie(name, value, opts)', 'set a cookie (values percent-encoded by default, matches PHP setcookie)'],
         ['RESP.writeraw(buf)', 'binary output channel: accepts bytes only; once used it short-circuits all text output; set Content-Type yourself via RESP.header'],
+        ['RESP.write(str) / echo(str)', 'output text from a code block (like PHP echo); interleaves correctly with template text and <%= %>; short-circuited by writeraw() and json()'],
         ['RESP.info()', 'print a phpinfo()-style report of the server, request and runtime environment (HTML in HTTP mode, plain text in CLI mode)'],
         ['require(spec)', 'Node require anchored at this template\'s directory: relative paths resolve against the .eta file\'s dir, bare names climb up searching node_modules; for ESM use the dynamic await import() form'],
         ['_GET / _POST / _REQUEST', 'request parameters (plain objects; _REQUEST merges GET+POST, POST wins)'],
@@ -1113,6 +1134,7 @@ function makeResp (defaultStatus) {
     headers: [],                 // list of [name, value] pairs
     binary: null,                // writeraw chunk list, null until touched
     text: null,                  // RESP.json() body, null until set
+    writeBuf: [],                // RESP.write() / echo() text buffer
     header: function (name, value) {
       const n = String(name)
       const v = String(value)
@@ -1190,9 +1212,13 @@ function makeResp (defaultStatus) {
       if (resp.binary === null) resp.binary = []
       resp.binary.push(Buffer.from(chunk))
     },
-    write: function () {
-      // no-op alias: in eta, output goes through template text / <%= %>
-      throw new Error('use template text or <%= %> for output')
+    write: function (str) {
+      // buffered text output from code blocks — like PHP echo.
+      // accumulates in writeBuf and is prepended to the rendered
+      // template text at assembly time; short-circuited by writeraw()
+      // and json() just like template text is.
+      resp.writeBuf.push(str === undefined || str === null
+        ? '' : String(str))
     },
     info: function () {
       // phpinfo()-style diagnostic page; HTML in HTTP mode, plain text
@@ -1200,7 +1226,9 @@ function makeResp (defaultStatus) {
       return renderInfo(resp._infoBridge || Object.create(null))
     },
     escape: escapeHtml,
+    echo: null,   // alias for write, assigned below to avoid circular ref
   }
+  resp.echo = resp.write
   return resp
 }
 
@@ -1379,6 +1407,7 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     _BODY: bodyBuf,
     _JSON: jsonVal,
     RESP: resp,
+    echo: resp.echo,
     escape: escapeHtml,
     require: makeDevRequire(ctx.rootReal, scriptAbs),
     _infoConfig: {
@@ -1591,11 +1620,16 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   if (!hmap.has('cache-control')) headers['Cache-Control'] = 'no-store'
 
   // ---- pick body: binary short-circuit > RESP.json() > rendered html ----
+  // writeBuf holds any RESP.write()/echo() calls made outside the Eta
+  // plugin's reach (e.g. before/after rendering); inside templates the
+  // plugin pushes directly into __eta.res so writeBuf stays empty.
   let body = html
   if (resp.binary !== null) {
     body = Buffer.concat(resp.binary)       // writeraw chunk list
   } else if (resp.text !== null) {
     body = resp.text
+  } else if (resp.writeBuf.length) {
+    body = resp.writeBuf.join('') + html
   }
 
   const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
@@ -2016,7 +2050,7 @@ async function renderCli (script, args) {
   resp._infoBridge = data
   resp._infoConfig = null
 
-  const eta = new Eta({ views: baseDir, cache: false, useWith: true, autoTrim: false })
+  const eta = new Eta({ views: baseDir, cache: false, useWith: true, autoTrim: false, plugins: [WRITE_HOOK_PLUGIN] })
   let html = ''
   try {
     html = await eta.renderStringAsync(src, data)
@@ -2033,6 +2067,8 @@ async function renderCli (script, args) {
     body = Buffer.concat(resp.binary)       // writeraw chunk list
   } else if (resp.text !== null) {
     body = resp.text
+  } else if (resp.writeBuf.length) {
+    body = resp.writeBuf.join('') + html
   }
   process.stdout.write(body)
 }
@@ -2102,7 +2138,7 @@ function startServer (rootDir, port, host, options) {
     // persisted key AND the per-root derivation (decision #21)
     secret: deriveSecret(root, options.secret),
     sessionTtl: sessionTtl,
-    eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false }),
+    eta: new Eta({ views: root, cache: false, useWith: true, autoTrim: false, plugins: [WRITE_HOOK_PLUGIN] }),
     accessLog: accessLog,
     allowedHosts: allowedHosts,
     behindProxy: behindProxy,

@@ -1357,6 +1357,30 @@ async function main () {
       assert.strictEqual(await res.text(), 'abc')
     })
 
+    await check('RESP.write() / echo() interleave with template text', async () => {
+      writeDemo('t_echo.eta',
+        'A<% echo("X") %>B<% RESP.write("Y") %>C<%= "Z" %>')
+      const res = await fetch(BASE + '/t_echo.eta')
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(await res.text(), 'AXBYCZ')
+    })
+
+    await check('echo() in a loop', async () => {
+      writeDemo('t_echol.eta',
+        '<% ["a","b","c"].forEach(function(x){ echo("[" + x + "]") }) %>')
+      const res = await fetch(BASE + '/t_echol.eta')
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(await res.text(), '[a][b][c]')
+    })
+
+    await check('RESP.write() is short-circuited by writeraw', async () => {
+      writeDemo('t_echoraw.eta',
+        'before<% echo("dropped") %><% RESP.writeraw(Buffer.from("OK")) %>after')
+      const res = await fetch(BASE + '/t_echoraw.eta')
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(await res.text(), 'OK')
+    })
+
     await check('SERVER_NAME comes from the Host header', async () => {
       // CGI semantics: the name the client asked for, not the bind
       // address (which answered a useless '0.0.0.0' under -H 0.0.0.0)

@@ -149,6 +149,22 @@ function main () {
     assert.strictEqual(r.out, 'AB')
   })
 
+  check('echo() interleaves with template text', () => {
+    const p = writeTmp('echo.eta',
+      'A<% echo("X") %>B<% RESP.write("Y") %>C<%~ "Z" %>')
+    const r = run([p])
+    assert.strictEqual(r.code, 0)
+    assert.strictEqual(r.out, 'AXBYCZ')
+  })
+
+  check('echo() in a loop', () => {
+    const p = writeTmp('echol.eta',
+      '<% ["a","b","c"].forEach(function(x){ echo("[" + x + "]") }) %>')
+    const r = run([p])
+    assert.strictEqual(r.code, 0)
+    assert.strictEqual(r.out, '[a][b][c]')
+  })
+
   check('RESP.json short-circuits rendered text', () => {
     const p = writeTmp('json.eta',
       '<%~ RESP.json({ok: 1}) %>ignored')
