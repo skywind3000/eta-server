@@ -42,14 +42,20 @@ const SESSION_COOKIE_LIMIT = 4096
 // prototype chain — only write() is overridden per invocation.
 const WRITE_HOOK_PLUGIN = {
   processFnString: function (fnStr) {
+    // Match the whole `let __eta = { ... };` declaration. Eta 3.5.0 and
+    // 4.6.0 both accumulate output in `__eta.res`, but the declaration
+    // line differs slightly (4.x adds a `blocks` property). A regex that
+    // captures the whole line keeps the plugin compatible with both.
     return fnStr.replace(
-      'let __eta = {res: "", e: this.config.escapeFunction, f: this.config.filterFunction};',
-      'let __eta = {res: "", e: this.config.escapeFunction, f: this.config.filterFunction};\n' +
-      'if (it) {\n' +
-      '  it.RESP = Object.create(it.RESP || {});\n' +
-      '  it.RESP.write = function(s){__eta.res += (s==null?"":String(s))};\n' +
-      '  it.echo = it.RESP.write;\n' +
-      '}\n'
+      /let __eta = \{[\s\S]*?\};\n/,
+      function (match) {
+        return match +
+          'if (it) {\n' +
+          '  it.RESP = Object.create(it.RESP || {});\n' +
+          '  it.RESP.write = function(s){__eta.res += (s==null?"":String(s))};\n' +
+          '  it.echo = it.RESP.write;\n' +
+          '}\n'
+      }
     )
   }
 }
