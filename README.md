@@ -235,6 +235,7 @@ ProxyPassReverse /eta http://127.0.0.1:5000
 
 # forward the real client address / protocol to the app
 RequestHeader set X-Forwarded-Proto "https" env=HTTPS
+RequestHeader set X-Forwarded-Proto "http"  env=!HTTPS
 ```
 
 Everything under `/eta/...` is forwarded to eta-server (the prefix is stripped, so `/eta/hello.eta` arrives as `/hello.eta`). To serve the app at the site root instead, use `ProxyPass / http://127.0.0.1:5000/` — but then it shadows Apache's own document root for that vhost.
@@ -299,5 +300,4 @@ npm test    # runs tests/test_server.js (HTTP mode) and tests/test_cli.js (CLI m
 ## License
 
 MIT
-
 
