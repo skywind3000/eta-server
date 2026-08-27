@@ -30,7 +30,9 @@ Options:
 | `--access-log <path>` | append access log to `<path>`, `-` = stdout (HTTP mode only) | stderr |
 | `--allowed-hosts <list>` | extra `Host` names to accept, comma separated; `all` turns the check off (HTTP mode only) | loopback names, `*.localhost`, literal IPs, bind address |
 | `--secret <value>` | session signing key, set it yourself; env `ETA_SERVER_SECRET` (HTTP mode only) | random per-user key, mixed with the document root |
+| `--session-ttl <minutes>` | sliding session timeout in minutes (HTTP mode only) | 30 |
 | `--behind-proxy` | behind a reverse proxy: skip the Host check, trust `X-Forwarded-For/-Proto/-Host` (HTTP mode only) | off |
+| `--allow-uploads` | accept multipart file uploads into `_FILES` (HTTP mode only) | off |
 | `-h, --help` | help | |
 
 With no positional argument it starts the HTTP server; with one, it renders that script once to stdout (CLI mode, below).
@@ -110,7 +112,7 @@ All bridge names are available bare in templates (thanks to Eta `useWith`); the 
 | `_GET` / `_POST` / `_REQUEST` | query params / form-urlencoded + multipart fields / merged (POST wins) |
 | `_SERVER` | request environment: `REQUEST_METHOD`, `QUERY_STRING`, `REQUEST_URI`, `SCRIPT_NAME`, `PATH_INFO`, `SCRIPT_FILENAME`, `SCRIPT_DIRNAME`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME`, `SERVER_PORT`, `REQUEST_SCHEME` (the first, third and sixth follow `X-Forwarded-*` under `--behind-proxy`), `SERVER_PROTOCOL`, `REQUEST_TIME` / `REQUEST_TIME_FLOAT`, `HTTP_*` headers, plus `argv` in CLI mode |
 | `_ENV` | environment variables snapshot (like PHP `$_ENV`) |
-| `_FILES` | uploaded files from multipart/form-data — PHP `$_FILES` shape (`name`/`type`/`size`/`tmp_name`/`error`); temp files cleaned up after the response |
+| `_FILES` | uploaded files from multipart/form-data — PHP `$_FILES` shape (`name`/`type`/`size`/`tmp_name`/`error`); opt-in via `--allow-uploads` (default off: file parts arrive with `error` 8 and no `tmp_name`, fields still parse); temp files cleaned up after the response |
 | `_COOKIE` | cookie dict (values percent-decoded) |
 | `_SESSION` | session object — signed-cookie based, no server-side storage, sliding 30-minute timeout. Mutate in place, or reassign the whole object (`_SESSION = {}`) to clear it |
 | `_BODY` | raw request body (Buffer, like `php://input`) |

@@ -7,7 +7,7 @@
  * Requires Node 18+ (global fetch).
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/27 22:34:00
+ * Last Modified: 2026/08/27 23:40:00
  *
  * ===================================================================== */
 'use strict'
@@ -132,8 +132,11 @@ function getSessionCookie (res) {
 function SESSION_NAME () { return 'ETASESSION=' }
 
 async function main () {
+  // --allow-uploads: the spawned main instance runs WITH uploads enabled
+  // so every existing upload test exercises the enabled path; the
+  // default-off path is covered by an in-process instance below
   const child = spawn(process.execPath,
-    [SERVER, '-r', ROOT, '-p', String(PORT)],
+    [SERVER, '-r', ROOT, '-p', String(PORT), '--allow-uploads'],
     { stdio: ['ignore', 'pipe', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', (c) => { stderr += c.toString() })
@@ -444,6 +447,43 @@ async function main () {
       assert.strictEqual(data.type, 'text/plain')
       assert.strictEqual(data.err, 0)
     })
+
+    await check('file uploads disabled by default (no --allow-uploads)',
+      async () => {
+        // uploads are opt-in (decision #30): without the flag a file
+        // part is parsed (name / type / size stay honest) but never
+        // written to disk — error 8 (UPLOAD_ERR_EXTENSION) and an
+        // empty tmp_name — while regular fields still parse
+        const mod = require(SERVER)
+        const portE = PORT + 8
+        const srv = await mod.startServer(ROOT, portE, '127.0.0.1',
+          { quiet: true })
+        try {
+          writeDemo('t_upl3.eta',
+            '<%~ JSON.stringify({post: _POST.a, err: _FILES.f.error, ' +
+            'tmp: _FILES.f.tmp_name, size: _FILES.f.size}) %>')
+          const res = await fetch('http://127.0.0.1:' + portE +
+            '/t_upl3.eta', {
+            method: 'POST',
+            headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+            body: '--B\r\n' +
+              'Content-Disposition: form-data; name="a"\r\n\r\n1\r\n' +
+              '--B\r\n' +
+              'Content-Disposition: form-data; name="f"; ' +
+              'filename="x.txt"\r\n\r\n' +
+              'hello\r\n--B--\r\n',
+          })
+          assert.strictEqual(res.status, 200)
+          const data = JSON.parse(await res.text())
+          assert.strictEqual(data.post, '1')
+          assert.strictEqual(data.err, 8)
+          assert.strictEqual(data.tmp, '')
+          assert.strictEqual(data.size, 5)
+        } finally {
+          if (srv.closeAllConnections) srv.closeAllConnections()
+          await new Promise(r => srv.close(r))
+        }
+      })
 
     await check('multipart too many fields returns 413', async () => {
       let body = ''

@@ -8,7 +8,7 @@
  * Requires Node 18+.
  *
  * Created by skywind on 2026/08/18
- * Last Modified: 2026/08/20 02:10:00
+ * Last Modified: 2026/08/27 23:40:00
  *
  * ===================================================================== */
 'use strict'
@@ -265,6 +265,16 @@ function main () {
     const r = run(['--secret', 'abc', path.join(tmpdir, 'sec.eta')])
     assert.strictEqual(r.code, 0)
     assert.strictEqual(r.out, 'SEC-OK')
+  })
+
+  check('--allow-uploads before a script is accepted and ignored (CLI mode)', () => {
+    // CLI mode has no request body, so the flag is meaningless there —
+    // but accepting it keeps the "options before the script name"
+    // leniency uniform (PHP-style, decision #11)
+    writeTmp('aup.eta', 'AUP-OK')
+    const r = run(['--allow-uploads', path.join(tmpdir, 'aup.eta')])
+    assert.strictEqual(r.code, 0)
+    assert.strictEqual(r.out, 'AUP-OK')
   })
 
   check('--session-ttl validates its value', () => {

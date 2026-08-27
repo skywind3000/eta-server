@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/27 22:34:00
+ * Last Modified: 2026/08/27 23:40:00
  *
  * ===================================================================== */
 'use strict'
@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.12.1'
+const VERSION = '0.13.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
@@ -479,7 +479,13 @@ const UPLOAD_ERR_EXTENSION = 8
 // File contents are written to a temp directory so templates can read
 // them via fs, mirroring PHP's tmp_name semantics. The caller receives
 // the list of temp file paths so it can clean them up after the response.
-function parseMultipart (buf, contentType) {
+// When `allowUploads` is false (the default; --allow-uploads enables,
+// decision #30) file parts are still parsed — name / type / size stay
+// honest — but nothing is written to disk: the entry arrives with
+// error = UPLOAD_ERR_EXTENSION and an empty tmp_name, while regular
+// fields still populate `fields` (PHP's file_uploads directive with a
+// safer default).
+function parseMultipart (buf, contentType, allowUploads) {
   const fields = Object.create(null)
   const files = Object.create(null)
   const tempFiles = []
@@ -499,13 +505,16 @@ function parseMultipart (buf, contentType) {
   const boundaryBuf = Buffer.from(boundary, 'latin1')
   const endBoundaryBuf = Buffer.from(boundary + '--', 'latin1')
 
-  // create a temp directory for uploaded files
+  // create a temp directory for uploaded files — only when uploads
+  // are enabled: the disabled path must not touch the disk at all
   let tmpDir = null
-  try {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eta-up-'))
-  } catch (e) {
-    // no temp dir available: files will have tmp_name '' and error set
-    tmpDir = null
+  if (allowUploads) {
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eta-up-'))
+    } catch (e) {
+      // no temp dir available: files will have tmp_name '' and error set
+      tmpDir = null
+    }
   }
 
   // split body on boundary; each part is between two boundary lines.
@@ -589,7 +598,12 @@ function parseMultipart (buf, contentType) {
 
       let tmpName = ''
       let err = UPLOAD_ERR_OK
-      if (tmpDir === null) {
+      if (!allowUploads) {
+        // uploads are opt-in (--allow-uploads, decision #30): parse the
+        // part but never write it; UPLOAD_ERR_EXTENSION is PHP's
+        // "upload stopped by policy" code
+        err = UPLOAD_ERR_EXTENSION
+      } else if (tmpDir === null) {
         err = UPLOAD_ERR_NO_TMP_DIR
       } else if (origName === '') {
         // empty filename means no file was selected (PHP UPLOAD_ERR_NO_FILE)
@@ -1208,6 +1222,7 @@ function infoSections (bridge) {
         ['Document Root', config.root],
         ['Session Timeout', ttlStr + ' minutes'],
         ['Behind Proxy', config.behindProxy ? 'yes' : 'no'],
+        ['Allow Uploads', config.allowUploads ? 'yes' : 'no'],
         ['Allowed Hosts', allowed],
       ]
     })
@@ -1620,7 +1635,7 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   let uploadedTempFiles = []
   const ctype = String(req.headers['content-type'] || '')
   if (ctype.indexOf('multipart/form-data') >= 0) {
-    const parsed = parseMultipart(bodyBuf, ctype)
+    const parsed = parseMultipart(bodyBuf, ctype, ctx.allowUploads)
     if (parsed.error) {
       // clean up any temp files that were created before the limit was hit
       for (const f of parsed.tempFiles) {
@@ -1713,6 +1728,7 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
     _infoConfig: {
       sessionTtl: ctx.sessionTtl,
       behindProxy: ctx.behindProxy,
+      allowUploads: ctx.allowUploads,
       allowedHosts: ctx.allowedHosts,
       host: ctx.host,
       port: ctx.port,
@@ -2499,6 +2515,9 @@ function startServer (rootDir, port, host, options) {
     accessLog: accessLog,
     allowedHosts: allowedHosts,
     behindProxy: behindProxy,
+    // --allow-uploads (decision #30): multipart file writes are opt-in;
+    // immutable startup config like every other ctx member (decision #14)
+    allowUploads: !!options.allowUploads,
   }
 
   if (allowedHosts === null) {
@@ -2611,6 +2630,10 @@ function printHelp () {
   console.log('                      Host check and take the client address /')
   console.log('                      scheme / host from X-Forwarded-For,')
   console.log('                      X-Forwarded-Proto, X-Forwarded-Host')
+  console.log('  --allow-uploads     accept multipart file uploads into _FILES')
+  console.log('                      (default: off; file parts then arrive with')
+  console.log('                      error 8 and no tmp_name while regular fields')
+  console.log('                      still parse) (HTTP mode only)')
   console.log('  -h, --help          show this help')
   console.log('')
   console.log('CLI mode:')
@@ -2622,6 +2645,7 @@ function printHelp () {
 function parseArgs (argv) {
   const opts = { root: process.cwd(), port: 5000, host: '127.0.0.1',
     quiet: false, accessLog: null, allowedHosts: null, behindProxy: false,
+    allowUploads: false,
     // env channel for the same value, and the one to prefer: a command
     // line is readable by every process on the box (ps / Task Manager)
     // and lands in shell history, while the supervisor config in the
@@ -2669,6 +2693,8 @@ function parseArgs (argv) {
       opts.sessionTtl = m
     } else if (a === '--behind-proxy') {
       opts.behindProxy = true
+    } else if (a === '--allow-uploads') {
+      opts.allowUploads = true
     } else if (a === '-h' || a === '--help') {
       printHelp()
       process.exit(0)
@@ -2716,6 +2742,7 @@ if (require.main === module) {
       allowedHosts: opts.allowedHosts, behindProxy: opts.behindProxy,
       secret: opts.secret,
       sessionTtl: opts.sessionTtl,
+      allowUploads: opts.allowUploads,
     }).then((server) => {
       printBanner(path.resolve(opts.root), opts.port, opts.host)
       const shutdown = () => {
