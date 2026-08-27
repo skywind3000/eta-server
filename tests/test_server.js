@@ -7,7 +7,7 @@
  * Requires Node 18+ (global fetch).
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/20 03:20:00
+ * Last Modified: 2026/08/27 22:34:00
  *
  * ===================================================================== */
 'use strict'
@@ -179,6 +179,27 @@ async function main () {
       const body = await res.text()
       assert.ok(body.indexOf('static index.html fallback') >= 0)
     })
+
+    await check('POST directory with static index returns 405 (index ' +
+      'candidates honor GET/HEAD)', async () => {
+        // the index.html candidate used to skip the method check the
+        // direct static branch enforces, so POST /sub/ served the page
+        // while POST /sub/index.html correctly answered 405
+        const res = await fetch(BASE + '/sub/', { method: 'POST' })
+        assert.strictEqual(res.status, 405)
+        assert.strictEqual(res.headers.get('allow'), 'GET, HEAD')
+        await res.text()
+      })
+
+    await check('POST directory with index.eta still renders (scripts ' +
+      'take every verb)', async () => {
+        // the 405 above must not leak into the index.eta path: .eta
+        // scripts render for every verb, REQUEST_METHOD passthrough
+        const res = await fetch(BASE + '/', { method: 'POST' })
+        assert.strictEqual(res.status, 200)
+        const body = await res.text()
+        assert.ok(body.indexOf('eta-server Demo') >= 0)
+      })
 
     await check('static file served with Content-Type', async () => {
       const res = await fetch(BASE + '/style.css')
@@ -510,6 +531,40 @@ async function main () {
         assert.strictEqual(res.status, 200)
         const data = await res.json()
         assert.deepStrictEqual(data.post, { a: 'x--B--y' })
+      })
+
+    await check('multipart part-count limit aborts splitting early ' +
+      '(bounded memory)', async () => {
+        // a 1-char boundary turns every 5 bytes into a "part": the
+        // count check used to run only after the WHOLE body had been
+        // split, so a 2MB bomb of empty delimiters (~400K parts, well
+        // under the 64MB cap) allocated ~90MB before the 413 went out
+        // — measured ~45x amplification. Splitting now stops at the
+        // 321st part, so RSS must stay close to the body size
+        const mod = require(SERVER)
+        const portD = PORT + 7
+        const srv = await mod.startServer(ROOT, portD, '127.0.0.1',
+          { quiet: true })
+        try {
+          const bomb = '--B\r\n'.repeat(400000) + '--B--\r\n'
+          const before = process.memoryUsage().rss
+          const res = await fetch('http://127.0.0.1:' + portD + '/api.eta', {
+            method: 'POST',
+            headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+            body: bomb,
+          })
+          assert.strictEqual(res.status, 413)
+          await res.arrayBuffer()
+          // body (~2MB) + undici copies + GC noise is all that may
+          // show up; the unfixed code measured ~90MB here
+          const growth = process.memoryUsage().rss - before
+          assert.ok(growth < 48 * 1024 * 1024,
+            'RSS grew ' + (growth / 1048576).toFixed(1) +
+              'MB for a 2MB bounded-part bomb')
+        } finally {
+          if (srv.closeAllConnections) srv.closeAllConnections()
+          await new Promise(r => srv.close(r))
+        }
       })
 
     await check('form-urlencoded too many fields returns 413', async () => {

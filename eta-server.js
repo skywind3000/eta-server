@@ -13,7 +13,7 @@
  *   eta-server [options] - [args...]            # read the script from stdin
  *
  * Created by skywind on 2026/02/16
- * Last Modified: 2026/08/20 03:20:00
+ * Last Modified: 2026/08/27 22:34:00
  *
  * ===================================================================== */
 'use strict'
@@ -27,7 +27,7 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.12.0'
+const VERSION = '0.12.1'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
@@ -516,6 +516,7 @@ function parseMultipart (buf, contentType) {
   // 25-byte file came back as 5 bytes
   let pos = 0
   const parts = []
+  const maxParts = MULTIPART_MAX_FIELDS + MULTIPART_MAX_FILES
   while (true) {
     let idx = buf.indexOf(boundaryBuf, pos)
     while (idx !== -1 && idx !== 0 &&
@@ -524,6 +525,16 @@ function parseMultipart (buf, contentType) {
     }
     if (idx === -1) break
     if (pos > 0) {
+      // the part-count limit fires WHILE splitting, not after it: the
+      // boundary comes from the request's own Content-Type, and a
+      // 1-char boundary slices a 64MB body into ~13M empty parts — the
+      // old count-after-building allocated every one of them (~45x RSS
+      // amplification, measured) before rejecting with 413. Threshold
+      // unchanged: the 321st part is still the failure point
+      if (parts.length >= maxParts) {
+        fail('multipart: too many parts')
+        break
+      }
       // part content is between the previous boundary end and this one;
       // strip the trailing \r\n that precedes the delimiter line
       let end = idx
@@ -538,10 +549,6 @@ function parseMultipart (buf, contentType) {
     pos = after
     // skip \r\n after boundary
     if (buf[pos] === 0x0d && buf[pos + 1] === 0x0a) pos += 2
-  }
-
-  if (parts.length > MULTIPART_MAX_FIELDS + MULTIPART_MAX_FILES) {
-    fail('multipart: too many parts')
   }
 
   for (const part of parts) {
@@ -2273,6 +2280,19 @@ async function handleRequest (req, res, ctx) {
           const type = STATIC_TYPES[path.extname(realF).toLowerCase()]
           if (!type) {
             return sendNotFound(req, res, ctx, parsed, reqStart)
+          }
+          // index candidates are static files too, so the direct
+          // branch's GET/HEAD-only rule applies here — POST /sub/ used
+          // to serve index.html through this path while POST
+          // /sub/index.html correctly answered 405. Checked after the
+          // gate/type checks (same ordering as the direct branch) so a
+          // 405 never leaks the existence of an index the path rules
+          // would deny; index.eta is untouched — scripts render for
+          // every verb, PHP semantics (decision #29)
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405, { 'Allow': 'GET, HEAD' })
+            res.end()
+            return
           }
           return await sendStatic(req, res, realF, type)
         }
