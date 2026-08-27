@@ -27,13 +27,21 @@ const net = require('node:net')
 const { createRequire } = require('node:module')
 const { Eta } = require('eta')
 
-const VERSION = '0.10.0'
+const VERSION = '0.11.0'
 const MAX_BODY = 64 * 1024 * 1024
 const SESSION_COOKIE = 'ETASESSION'
 const SESSION_TTL = 30 * 60 * 1000          // default sliding timeout: 30 min
 // cookie capacity guard: an oversized session
 // cookie is silently dropped by browsers anyway; fail loudly instead
 const SESSION_COOKIE_LIMIT = 4096
+
+// multipart/form-data guards: keep the dev-server surface bounded so
+// a malformed or malicious upload cannot exhaust temp disk space or
+// create an unbounded number of files/fields.
+const MULTIPART_MAX_FIELDS = 256
+const MULTIPART_MAX_FILES = 64
+const MULTIPART_MAX_FILE_SIZE = 16 * 1024 * 1024   // 16 MB per file
+const MULTIPART_MAX_HEADER_SIZE = 8192             // 8 KB per-part headers
 
 // Eta plugin: inject a per-invocation wrapper into the compiled template
 // so that RESP.write() / echo() emit text during rendering.
@@ -465,10 +473,18 @@ function parseMultipart (buf, contentType) {
   const fields = Object.create(null)
   const files = Object.create(null)
   const tempFiles = []
+  let fieldCount = 0
+  let fileCount = 0
+  let error = null
+
+  function fail (msg) {
+    error = new Error(msg)
+    return true
+  }
 
   // extract boundary from Content-Type
   const m = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i)
-  if (!m) return { fields, files, tempFiles }
+  if (!m) return { fields, files, tempFiles, tmpDir: null, error }
   const boundary = '--' + (m[1] || m[2]).trim()
   const boundaryBuf = Buffer.from(boundary, 'latin1')
   const endBoundaryBuf = Buffer.from(boundary + '--', 'latin1')
@@ -506,10 +522,19 @@ function parseMultipart (buf, contentType) {
     if (buf[pos] === 0x0d && buf[pos + 1] === 0x0a) pos += 2
   }
 
+  if (parts.length > MULTIPART_MAX_FIELDS + MULTIPART_MAX_FILES) {
+    fail('multipart: too many parts')
+  }
+
   for (const part of parts) {
+    if (error) break
     // split headers from body at the first blank line (\r\n\r\n)
     const headerEnd = part.indexOf('\r\n\r\n')
     if (headerEnd === -1) continue
+    if (headerEnd > MULTIPART_MAX_HEADER_SIZE) {
+      fail('multipart: part header too large')
+      break
+    }
     const headerBlock = part.slice(0, headerEnd).toString('latin1')
     const body = part.slice(headerEnd + 4)
 
@@ -522,11 +547,20 @@ function parseMultipart (buf, contentType) {
     let fieldName = nameMatch[1]
 
     if (fileMatch) {
+      if (fileCount >= MULTIPART_MAX_FILES) {
+        fail('multipart: too many files')
+        break
+      }
       // file upload
       const origName = fileMatch[1]
       const mime = typeMatch ? typeMatch[1].trim() : 'application/octet-stream'
       const isArrayField = fieldName.endsWith('[]')
       if (isArrayField) fieldName = fieldName.slice(0, -2)
+
+      if (body.length > MULTIPART_MAX_FILE_SIZE) {
+        fail('multipart: file too large')
+        break
+      }
 
       let tmpName = ''
       let err = UPLOAD_ERR_OK
@@ -547,6 +581,7 @@ function parseMultipart (buf, contentType) {
         }
       }
 
+      fileCount++
       const entry = {
         name: origName,
         type: mime,
@@ -571,12 +606,17 @@ function parseMultipart (buf, contentType) {
         files[fieldName] = entry
       }
     } else {
+      if (fieldCount >= MULTIPART_MAX_FIELDS) {
+        fail('multipart: too many fields')
+        break
+      }
       // regular form field
       fields[fieldName] = body.toString('utf8')
+      fieldCount++
     }
   }
 
-  return { fields, files, tempFiles, tmpDir }
+  return { fields, files, tempFiles, tmpDir, error }
 }
 
 /* ---------------------------------------------------------------------
@@ -702,8 +742,12 @@ function hostnameOf (hostHeader) {
     const i = h.indexOf(']')
     return i > 0 ? h.slice(1, i).toLowerCase() : ''
   }
+  // A bare IP literal (IPv4 or IPv6) should be accepted as-is; this
+  // fixes the case where Host: ::1 was mishandled by the host:port
+  // splitting logic below.
+  if (net.isIP(h) !== 0) return h.toLowerCase()
   const i = h.lastIndexOf(':')
-  // one colon only = host:port; several = a bare IPv6 literal, keep it
+  // one colon only = host:port; several = malformed IPv6-with-port, keep it
   if (i >= 0 && h.indexOf(':') === i) h = h.slice(0, i)
   return h.toLowerCase()
 }
@@ -754,6 +798,9 @@ function buildAllowedHosts (host, spec) {
 function normalizeIp (value) {
   let v = String(value).trim()
   if (!v) return ''
+  // Accept a plain IP literal first; this covers bare IPv6 addresses
+  // such as ::1 without requiring brackets.
+  if (net.isIP(v) !== 0) return v
   // some proxies append the source port: '[2001:db8::1]:443' or
   // '192.0.2.1:1234' — the address is the part we want
   if (v.charAt(0) === '[') {
@@ -1549,6 +1596,23 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   const ctype = String(req.headers['content-type'] || '')
   if (ctype.indexOf('multipart/form-data') >= 0) {
     const parsed = parseMultipart(bodyBuf, ctype)
+    if (parsed.error) {
+      // clean up any temp files that were created before the limit was hit
+      for (const f of parsed.tempFiles) {
+        try { fs.unlinkSync(f) } catch (e) { /* already gone */ }
+      }
+      if (parsed.tmpDir) {
+        try { fs.rmdirSync(parsed.tmpDir) } catch (e) { /* ignore */ }
+      }
+      const err = parsed.error
+      err.status = 413
+      if (opts.plain404OnError) {
+        console.error('eta-server: fallback page multipart parse failed (' +
+          err.message + '), degrading to the built-in 404')
+        return sendError(res, 404, 'Not Found')
+      }
+      return sendError(res, 413, 'Payload Too Large', err.message)
+    }
     post = parsed.fields
     files = parsed.files
     uploadedTempFiles = parsed.tempFiles
@@ -1626,7 +1690,7 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
   try {
     // read the file ourselves and render the string: bypasses eta's
     // file resolution quirks and gives mtime-based reload for free
-    const src = stripBom(fs.readFileSync(scriptAbs, 'utf8'))
+    const src = stripBom(await fs.promises.readFile(scriptAbs, 'utf8'))
     html = await ctx.eta.renderStringAsync(src, data)
   } catch (err) {
     if (opts.plain404OnError) {
@@ -1846,25 +1910,54 @@ async function renderTemplate (req, res, ctx, parsed, scriptAbs, scriptName,
  * static files
  * ------------------------------------------------------------------- */
 
-function sendStatic (req, res, abs, type) {
+// Promise wrappers around the numeric-fd fs APIs.  We intentionally avoid
+// fs.promises.open() here: its FileHandle closes the descriptor on garbage
+// collection, and handing handle.fd to fs.createReadStream({ fd }) makes
+// two owners for the same fd, which produces EBADF when the stream and the
+// GC finalizer both call close().
+function openFd (p) {
+  return new Promise((resolve, reject) => {
+    fs.open(p, 'r', (err, fd) => {
+      if (err) return reject(err)
+      resolve(fd)
+    })
+  })
+}
+
+function fstatFd (fd) {
+  return new Promise((resolve, reject) => {
+    fs.fstat(fd, (err, stat) => {
+      if (err) return reject(err)
+      resolve(stat)
+    })
+  })
+}
+
+function closeFd (fd) {
+  return new Promise((resolve) => {
+    fs.close(fd, () => resolve())
+  })
+}
+
+async function sendStatic (req, res, abs, type) {
   // open once, fstat the SAME fd: a stat-then-stream pair can observe
   // two generations of the file when it is rewritten in between, and
   // the declared Content-Length would disagree with the streamed bytes
-  let fd = null
+  let fd
   try {
-    fd = fs.openSync(abs, 'r')
+    fd = await openFd(abs)
   } catch (e) {
     return sendError(res, 404, 'Not Found')
   }
-  let stat = null
+  let stat
   try {
-    stat = fs.fstatSync(fd)
+    stat = await fstatFd(fd)
   } catch (e) {
-    try { fs.closeSync(fd) } catch (e2) { /* ignore */ }
+    await closeFd(fd)
     return sendError(res, 404, 'Not Found')
   }
   if (!stat.isFile()) {
-    try { fs.closeSync(fd) } catch (e) { /* ignore */ }
+    await closeFd(fd)
     return sendError(res, 404, 'Not Found')
   }
   res.writeHead(200, {
@@ -1875,12 +1968,15 @@ function sendStatic (req, res, abs, type) {
     'Cache-Control': 'no-store'
   })
   if (req.method === 'HEAD') {
-    try { fs.closeSync(fd) } catch (e) { /* ignore */ }
+    await closeFd(fd)
     res.end()
     return
   }
-  // fd handed over to the stream (autoClose releases it on end/error)
-  const stream = fs.createReadStream(abs, { fd })
+  // fd handed over to the stream (autoClose releases it on end/error).
+  // The numeric fd is used so the close path goes through fs.close,
+  // which existing regression tests intercept to verify that client
+  // aborts do not leak descriptors.
+  const stream = fs.createReadStream('', { fd })
   stream.on('error', () => {
     try { res.destroy() } catch (e) { /* ignore */ }
   })
@@ -1918,7 +2014,7 @@ async function sendNotFound (req, res, ctx, parsed, reqStart) {
   const fb = path.join(ctx.root, '.404.eta')
   let st = null
   try {
-    st = fs.statSync(fb)
+    st = await fs.promises.stat(fb)
   } catch (e) { /* no fallback */ }
   if (st && st.isFile()) {
     // the one deliberate exception to gateReal(): the fallback page is
@@ -2074,7 +2170,7 @@ async function handleRequest (req, res, ctx) {
     }
     let stat = null
     try {
-      stat = fs.statSync(scriptAbs)
+      stat = await fs.promises.stat(scriptAbs)
     } catch (e) { /* handled below */ }
     if (stat && stat.isFile()) {
       // a symlink / junction inside root pointing outside must not be
@@ -2097,7 +2193,7 @@ async function handleRequest (req, res, ctx) {
   // ---- directory branch: 301 slash, then index fallbacks ----
   let stat = null
   try {
-    stat = fs.statSync(target)
+    stat = await fs.promises.stat(target)
   } catch (e) {
     return sendNotFound(req, res, ctx, parsed, reqStart)
   }
@@ -2118,7 +2214,8 @@ async function handleRequest (req, res, ctx) {
     }
     const idxEta = path.join(real, 'index.eta')
     try {
-      if (fs.statSync(idxEta).isFile()) {
+      const idxStat = await fs.promises.stat(idxEta)
+      if (idxStat.isFile()) {
         // index candidates go through the gate on their own: the
         // directory passed, but an index symlink inside it may still
         // point outside the root — or at the server's own file, which
@@ -2135,7 +2232,8 @@ async function handleRequest (req, res, ctx) {
     for (const name of ['index.html', 'index.htm']) {
       const f = path.join(real, name)
       try {
-        if (fs.statSync(f).isFile()) {
+        const idxStat = await fs.promises.stat(f)
+        if (idxStat.isFile()) {
           const realF = gateReal(req, ctx.rootReal, f)
           if (!realF) {
             return sendNotFound(req, res, ctx, parsed, reqStart)
@@ -2147,7 +2245,7 @@ async function handleRequest (req, res, ctx) {
           if (!type) {
             return sendNotFound(req, res, ctx, parsed, reqStart)
           }
-          return sendStatic(req, res, realF, type)
+          return await sendStatic(req, res, realF, type)
         }
       } catch (e) { /* keep looking */ }
     }
@@ -2165,7 +2263,7 @@ async function handleRequest (req, res, ctx) {
     res.end()
     return
   }
-  return sendStatic(req, res, real, type)
+  return await sendStatic(req, res, real, type)
 }
 
 /* ---------------------------------------------------------------------

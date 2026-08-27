@@ -424,6 +424,62 @@ async function main () {
       assert.strictEqual(data.err, 0)
     })
 
+    await check('multipart too many fields returns 413', async () => {
+      let body = ''
+      for (let i = 0; i < 257; i++) {
+        body += '--B\r\nContent-Disposition: form-data; name="f' + i + '"\r\n\r\nx\r\n'
+      }
+      body += '--B--\r\n'
+      const res = await fetch(BASE + '/api.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+        body,
+      })
+      assert.strictEqual(res.status, 413)
+    })
+
+    await check('multipart too many files returns 413', async () => {
+      let body = ''
+      for (let i = 0; i < 65; i++) {
+        body += '--B\r\n' +
+          'Content-Disposition: form-data; name="f"; filename="a' + i + '.txt"\r\n\r\n' +
+          'x\r\n'
+      }
+      body += '--B--\r\n'
+      const res = await fetch(BASE + '/api.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+        body,
+      })
+      assert.strictEqual(res.status, 413)
+    })
+
+    await check('multipart file too large returns 413', async () => {
+      const big = 'x'.repeat(16 * 1024 * 1024 + 1)
+      const body = '--B\r\n' +
+        'Content-Disposition: form-data; name="f"; filename="big.txt"\r\n\r\n' +
+        big + '\r\n--B--\r\n'
+      const res = await fetch(BASE + '/api.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+        body,
+      })
+      assert.strictEqual(res.status, 413)
+    })
+
+    await check('multipart part header too large returns 413', async () => {
+      const body = '--B\r\n' +
+        'Content-Disposition: form-data; name="f"\r\n' +
+        'X-Pad: ' + 'x'.repeat(8192) + '\r\n\r\n' +
+        'value\r\n--B--\r\n'
+      const res = await fetch(BASE + '/api.eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=B' },
+        body,
+      })
+      assert.strictEqual(res.status, 413)
+    })
+
     await check('_ENV exposes environment variables', async () => {
       // PATH is 'Path' on Windows; use a portable probe
       writeDemo('t_env.eta',
@@ -815,6 +871,16 @@ async function main () {
         await new Promise(r => setTimeout(r, 100))
         assert.ok(stderr.indexOf('blocked by host allowlist') >= 0,
           'host allowlist blocks must be logged to stderr')
+      })
+
+    await check('bare IPv6 Host literal is allowed',
+      async () => {
+        // Host: ::1 (no brackets, no port) used to be mis-parsed as
+        // host:port and rejected; it must be accepted as a literal IP
+        const ok1 = await rawGet(PORT, '::1', '/index.eta')
+        assert.strictEqual(ok1.status, 200, 'bare ::1')
+        const ok2 = await rawGet(PORT, '[::1]', '/index.eta')
+        assert.strictEqual(ok2.status, 200, 'bracketed [::1] without port')
       })
 
     await check('--allowed-hosts extends the list, "all" disables it',
