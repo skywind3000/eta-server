@@ -119,6 +119,7 @@ All bridge names are available bare in templates (thanks to Eta `useWith`); the 
 | `RESP.json(data)` | convenience JSON response (does not stop rendering — pair with `return`) |
 | `RESP.setcookie(name, value, opts)` | set cookie (values percent-encoded by default) |
 | `RESP.writeraw(buf)` | binary output; once used it short-circuits all text output |
+| `RESP.write(str)` / `echo(str)` | output text from a code block (like PHP `echo`); interleaves with template text, so `A<% echo("X") %>B` renders `AXB` |
 | `escape(value)` / `RESP.escape` | HTML escape (`htmlspecialchars` equivalent) |
 | `require(spec)` | Node `require` anchored at the template's own directory — relative paths resolve against the `.eta` file's dir, bare names walk up to `node_modules` |
 
